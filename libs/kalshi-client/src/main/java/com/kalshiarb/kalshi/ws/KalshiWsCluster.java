@@ -92,6 +92,21 @@ public final class KalshiWsCluster implements AutoCloseable {
         }
     }
 
+    /**
+     * Requests a fresh snapshot on every connection, creating a verification checkpoint.
+     *
+     * @return how many connections were subscribed and actually asked
+     */
+    public int requestSnapshotAll() {
+        int asked = 0;
+        for (KalshiWsConnection c : connections.values()) {
+            if (c.requestSnapshotNow()) {
+                asked++;
+            }
+        }
+        return asked;
+    }
+
     /** Per-family state, for reporting. */
     public List<String> describe() {
         List<String> lines = new ArrayList<>(connections.size());

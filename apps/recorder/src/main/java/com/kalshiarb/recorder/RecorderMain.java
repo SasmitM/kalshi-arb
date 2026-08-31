@@ -61,6 +61,18 @@ public final class RecorderMain {
      */
     private static final Duration WATCHLIST_REFRESH = Duration.ofHours(6);
 
+    /**
+     * How often to ask every shard for a fresh snapshot.
+     *
+     * <p>These are the verification checkpoints the replay harness needs. Delta application has
+     * no natural error signal -- a double-applied or missed delta leaves a book that is quietly
+     * wrong while every metric reads green -- so the only way to prove reconstruction is correct
+     * is to periodically record what the exchange says the book actually is, and compare. The
+     * WebSocket consumes no rate-limit tokens, so the checkpoints are free; the only cost is
+     * archive size, and a snapshot is a few KB against ~4500 frames a minute.
+     */
+    private static final Duration SNAPSHOT_CHECKPOINT = Duration.ofMinutes(5);
+
     private RecorderMain() {
     }
 
@@ -208,6 +220,7 @@ public final class RecorderMain {
         WsMetrics m = cluster.metrics();
         long lastStatus = clock.nanoTime();
         long lastRefreshCheck = clock.nanoTime();
+        long lastCheckpoint = clock.nanoTime();
         List<MarketTicker> currentWatchlist = cluster.shards().stream()
                 .flatMap(s -> s.markets().stream())
                 .toList();
@@ -233,6 +246,13 @@ public final class RecorderMain {
                     System.out.printf("           file: %s%n", g.currentPath());
                 }
                 cluster.describe().forEach(l -> System.out.println("           " + l));
+            }
+
+            if (now - lastCheckpoint >= SNAPSHOT_CHECKPOINT.toNanos()) {
+                lastCheckpoint = now;
+                int asked = cluster.requestSnapshotAll();
+                System.out.printf("[%s] checkpoint: requested snapshots on %d shards%n",
+                        Instant.now(), asked);
             }
 
             // Roll onto newly opened events without a restart.

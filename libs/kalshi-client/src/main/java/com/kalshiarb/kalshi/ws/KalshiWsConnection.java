@@ -443,6 +443,25 @@ public final class KalshiWsConnection implements AutoCloseable {
         scheduleReconnect("forced: " + reason);
     }
 
+    /**
+     * Asks the exchange for a fresh snapshot on this connection's subscription.
+     *
+     * <p>Not only a recovery mechanism. Requested on a schedule it puts periodic checkpoints of
+     * authoritative state into the frame stream, which is the only way to verify that
+     * incrementally applied deltas have not silently diverged — delta application has no natural
+     * error signal of its own. Free in rate-limit terms, since the WebSocket consumes no tokens.
+     *
+     * @return false if the connection is not yet subscribed, so there is no sid to ask about
+     */
+    public boolean requestSnapshotNow() {
+        long sid = assignedSid;
+        if (sid < 0 || socket == null) {
+            return false;
+        }
+        requestSnapshot(sid);
+        return true;
+    }
+
     // ------------------------------------------------------------------ lifecycle
 
     private boolean sleepMillis(long millis) {
