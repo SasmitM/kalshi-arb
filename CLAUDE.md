@@ -428,5 +428,11 @@ from section 5 correctly comes out negative.
 
 ```bash
 ./gradlew build
-git ls-files | grep -Ei 'pem|key|env'    # must print nothing
+git ls-files | grep -Ei '\.(pem|key|p8|p12|pfx|jks)$|(^|/)\.env'   # must print nothing
 ```
+
+The credential check matches credential *files* — by extension, plus dotenv files —
+rather than any path containing the substrings `pem`, `key`, or `env`. The looser
+substring form flags legitimate sources whose names describe what they handle
+(`PemKeyLoader.java`, `KalshiCredentials.java`), and a check that always prints
+something is a check nobody reads.
