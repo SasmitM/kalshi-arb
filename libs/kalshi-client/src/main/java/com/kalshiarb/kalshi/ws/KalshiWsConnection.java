@@ -80,8 +80,16 @@ public final class KalshiWsConnection implements AutoCloseable {
      */
     private static final int QUEUE_CAPACITY = 65_536;
 
-    /** Silence longer than this means dead. Keyed off frames as well as pings. */
-    private static final Duration STALE_TIMEOUT = Duration.ofSeconds(35);
+    /**
+     * Silence longer than this means dead. Keyed off the last frame <i>or</i> ping.
+     *
+     * <p>Measured, not assumed: a live 3-minute run saw 16 pings across 4 sockets, i.e. roughly
+     * one per 45s per socket. CLAUDE.md's "~every 10s" is wrong by more than 4x. An earlier 35s
+     * timeout was therefore shorter than the actual ping interval — harmless while deltas flow,
+     * but an overnight quiet market would have reconnected every 35 seconds forever. 120s allows
+     * two and a half missed intervals.
+     */
+    private static final Duration STALE_TIMEOUT = Duration.ofSeconds(120);
 
     private static final Duration WATCHDOG_INTERVAL = Duration.ofSeconds(5);
     private static final Duration HANDSHAKE_TIMEOUT = Duration.ofSeconds(20);

@@ -379,7 +379,10 @@ while BUFFERING:
 Discarding deltas at or below `snapshot.seq` is essential — they're already
 baked into the snapshot.
 
-Kalshi sends Ping roughly every 10s and expects Pong.
+Kalshi sends Ping far less often than documented. **Measured: ~1 ping per 45s
+per connection** (16 pings across 4 sockets in 3 minutes), not every 10s. Any
+staleness timeout must exceed that or a quiet market reconnects forever; the
+connection manager uses 120s and keys off the last frame *or* ping.
 
 **Resolved: the JDK auto-responds. Do not send a Pong yourself.** The
 `java.net.http.WebSocket.Listener.onPing` javadoc states that "the WebSocket
