@@ -1,0 +1,45 @@
+// Root build. No source of its own; configures every subproject uniformly.
+// Java 21, JUnit 5 + AssertJ everywhere. See CLAUDE.md section 6.
+
+plugins {
+    java
+}
+
+subprojects {
+    apply(plugin = "java")
+
+    group = "com.kalshiarb"
+    version = "0.1.0"
+
+    repositories {
+        mavenCentral()
+    }
+
+    java {
+        toolchain {
+            languageVersion.set(JavaLanguageVersion.of(21))
+        }
+    }
+
+    tasks.withType<JavaCompile>().configureEach {
+        options.encoding = "UTF-8"
+        // Records, sealed types, pattern matching are all final in 21 — no preview needed.
+        options.compilerArgs.add("-Xlint:all")
+    }
+
+    tasks.withType<Test>().configureEach {
+        useJUnitPlatform()
+        testLogging {
+            events("passed", "skipped", "failed")
+        }
+    }
+
+    dependencies {
+        val versionCatalog = rootProject.extensions
+            .getByType<VersionCatalogsExtension>()
+            .named("libs")
+        "testImplementation"(versionCatalog.findLibrary("junit-jupiter").get())
+        "testRuntimeOnly"(versionCatalog.findLibrary("junit-platform-launcher").get())
+        "testImplementation"(versionCatalog.findLibrary("assertj-core").get())
+    }
+}

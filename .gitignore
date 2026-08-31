@@ -1,0 +1,39 @@
+# --- Credentials & secrets (NEVER commit) ---
+*.pem
+*.key
+*.p8
+*.pkcs8
+.env
+.env.*
+**/kalshi-private*
+**/kalshi-public*
+
+# --- Gradle ---
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# --- Java ---
+*.class
+*.log
+hs_err_pid*
+replay_pid*
+
+# --- IDE ---
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+out/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Recorder output (real market data can be large) ---
+data/
+*.jsonl.gz
