@@ -376,7 +376,8 @@ public final class KalshiWsConnection implements AutoCloseable {
 
     private void requestSnapshot(long sid) {
         try {
-            send(WsCommands.getSnapshot(commandIds.incrementAndGet(), sid));
+            send(WsCommands.getSnapshot(
+                    commandIds.incrementAndGet(), sid, shard.markets()));
         } catch (RuntimeException e) {
             transition(state, "get_snapshot for sid " + sid + " failed: " + e);
         }

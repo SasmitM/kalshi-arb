@@ -362,6 +362,17 @@ so the connection looks healthy and every book silently never initialises.
 Snapshots also carry a `market_id` UUID. Try each known spelling rather than
 assuming one, and throw listing the names tried if none match.
 
+**The `get_snapshot` command requires `market_tickers`.** Sending only
+`sids` + `action` is rejected with
+`{"type":"error","sid":1,"seq":1261,"msg":{"code":14,"msg":"Market Ticker required"}}`.
+Found by replaying an archive and tracing 12 phantom sequence gaps back to the
+exchange rejecting our own requests — meaning gap recovery had never worked; it
+had simply never fired.
+
+**Error frames carry a `seq`, like `ok` frames.** The general rule is
+*anything carrying a `seq` must advance the counter*, whether or not it changes
+a book. Enumerating known types has now failed twice.
+
 Gap recovery (do not tear down the connection):
 
 ```

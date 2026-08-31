@@ -60,13 +60,22 @@ public final class WsCommands {
      * Requests a fresh snapshot for one subscription, the in-place gap recovery path.
      *
      * <pre>{@code
-     * {"id":7,"cmd":"update_subscription","params":{"sids":[3],"action":"get_snapshot"}}
+     * {"id":7,"cmd":"update_subscription","params":{
+     *     "sids":[3],"market_tickers":["KXHIGHNY-26SEP01-T83",...],
+     *     "action":"get_snapshot"}}
      * }</pre>
+     *
+     * <p><b>{@code market_tickers} is required.</b> The form documented in CLAUDE.md, with only
+     * {@code sids} and {@code action}, is rejected:
+     * {@code {"type":"error","sid":1,"seq":1261,"msg":{"code":14,"msg":"Market Ticker required"}}}.
+     * That was found by replaying an archive and noticing 12 phantom sequence gaps, which turned
+     * out to be the exchange's rejections of our own snapshot requests. Until this was fixed, gap
+     * recovery could never have worked — it had simply never fired, because no gap had occurred.
      *
      * <p>Note this recovers a gap <b>without dropping the connection</b>. Reconnecting would
      * invalidate every other shard's books as collateral damage.
      */
-    public static String getSnapshot(long commandId, long sid) {
+    public static String getSnapshot(long commandId, long sid, List<MarketTicker> markets) {
         return write(gen -> {
             gen.writeStartObject();
             gen.writeNumberField("id", commandId);
@@ -74,6 +83,11 @@ public final class WsCommands {
             gen.writeObjectFieldStart("params");
             gen.writeArrayFieldStart("sids");
             gen.writeNumber(sid);
+            gen.writeEndArray();
+            gen.writeArrayFieldStart("market_tickers");
+            for (MarketTicker m : markets) {
+                gen.writeString(m.value());
+            }
             gen.writeEndArray();
             gen.writeStringField("action", "get_snapshot");
             gen.writeEndObject();

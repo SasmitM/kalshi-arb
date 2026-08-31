@@ -55,6 +55,10 @@ public final class BookReplay {
     /** Markets that have taken at least one delta since their last snapshot. */
     private final Map<MarketTicker, Integer> deltasSinceSnapshot = new HashMap<>();
 
+    /** Which markets belong to which family, so a session reset can invalidate them. */
+    private final Map<EventTicker, java.util.Set<MarketTicker>> marketsByFamily =
+            new HashMap<>();
+
     private long framesRead;
     private long deltasApplied;
     private long snapshotsSeen;
@@ -63,6 +67,9 @@ public final class BookReplay {
     private long seqBreaks;
     private long negativeLevels;
     private long crossedBooks;
+    private long sessionResets;
+    private long skippedAcrossReset;
+    private long errorFrames;
 
     // The verification counters that actually matter.
     private long comparisons;
@@ -129,8 +136,20 @@ public final class BookReplay {
                     checkSeq(archived.family(), ok.seq());
                 }
             }
+            case WsFrame.ErrorFrame err -> {
+                controlFrames++;
+                errorFrames++;
+                // Errors are sequenced too. Skipping their seq was manufacturing phantom gaps.
+                if (err.hasSeq()) {
+                    checkSeq(archived.family(), err.seq());
+                }
+                if (errorFrames <= 10) {
+                    System.err.printf("  exchange error on %s (seq %d): code=%s %s%n",
+                            archived.family(), err.seq(), err.code(), err.message());
+                }
+            }
             default -> {
-                // subscribed / error / unhandled carry no book state.
+                // subscribed / unhandled carry no book state and no seq.
             }
         }
     }
@@ -138,6 +157,9 @@ public final class BookReplay {
     private void onSnapshot(EventTicker family, WsFrame.Snapshot snap) {
         snapshotsSeen++;
         checkSeq(family, snap.seq());
+
+        marketsByFamily.computeIfAbsent(family, k -> new java.util.LinkedHashSet<>())
+                .add(snap.ticker());
 
         Book book = books.get(snap.ticker());
         int deltas = deltasSinceSnapshot.getOrDefault(snap.ticker(), 0);
@@ -167,6 +189,8 @@ public final class BookReplay {
 
     private void onDelta(EventTicker family, WsFrame.Delta delta) {
         checkSeq(family, delta.seq());
+        marketsByFamily.computeIfAbsent(family, k -> new java.util.LinkedHashSet<>())
+                .add(delta.ticker());
 
         Book book = books.get(delta.ticker());
         if (book == null) {
@@ -203,13 +227,38 @@ public final class BookReplay {
     private void checkSeq(EventTicker family, long seq) {
         Long expected = expectedSeq.get(family);
         if (expected != null && seq != expected) {
-            seqBreaks++;
-            if (seqBreaks <= 5) {
-                System.err.printf("  seq break on %s: expected %d, got %d%n",
-                        family, expected, seq);
+            if (seq < expected) {
+                // A seq going BACKWARDS is a new session, not a gap: a reconnect or a recorder
+                // restart reassigns the sid and restarts seq at 1. Frames were genuinely not
+                // recorded across that boundary, so the reconstructed book cannot be expected
+                // to match the next snapshot -- comparing across it would test whether the
+                // market moved while we were disconnected, which is not a property of this
+                // code. Invalidate instead, exactly as the live path does on reconnect.
+                sessionResets++;
+                onSessionReset(family, expected, seq);
+            } else {
+                seqBreaks++;
+                if (seqBreaks <= 5) {
+                    System.err.printf("  seq break on %s: expected %d, got %d (%d missing)%n",
+                            family, expected, seq, seq - expected);
+                }
             }
         }
         expectedSeq.put(family, seq + 1);
+    }
+
+    /** Drops comparison eligibility for a family whose stream restarted. */
+    private void onSessionReset(EventTicker family, long expected, long seq) {
+        System.err.printf("  session boundary on %s: seq restarted (%d -> %d); books "
+                        + "invalidated, comparisons skipped across the boundary%n",
+                family, expected, seq);
+        for (MarketTicker market : marketsByFamily.getOrDefault(family, java.util.Set.of())) {
+            if (deltasSinceSnapshot.getOrDefault(market, 0) > 0) {
+                skippedAcrossReset++;
+            }
+            deltasSinceSnapshot.put(market, 0);
+            books.remove(market);
+        }
     }
 
     /** No failures were observed. Says nothing about whether anything was verified. */
@@ -258,6 +307,9 @@ public final class BookReplay {
         System.out.println();
         System.out.println("==== verification ====");
         System.out.printf("  decode failures    : %d%n", decodeFailures);
+        System.out.printf("  exchange errors    : %d%n", errorFrames);
+        System.out.printf("  session boundaries : %d (comparisons skipped: %d)%n",
+                sessionResets, skippedAcrossReset);
         System.out.printf("  seq breaks         : %d%n", seqBreaks);
         System.out.printf("  negative levels    : %d%n", negativeLevels);
         System.out.printf("  crossed books      : %d%n", crossedBooks);

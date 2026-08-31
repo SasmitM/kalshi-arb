@@ -158,8 +158,9 @@ public final class SnapshotRecovery {
         return switch (frame) {
             case WsFrame.Snapshot snapshot -> onSnapshot(snapshot);
             case WsFrame.Delta delta -> onDelta(delta);
-            // Control frames: they hold a seq but touch no book.
+            // Control frames: they hold a seq but touch no book. Both ok and error do.
             case WsFrame.Ok ok -> onControl(ok);
+            case WsFrame.ErrorFrame err -> onControl(err);
         };
     }
 

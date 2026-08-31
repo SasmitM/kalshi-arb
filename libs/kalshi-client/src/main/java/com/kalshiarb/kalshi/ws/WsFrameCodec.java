@@ -224,8 +224,9 @@ public final class WsFrameCodec {
                 return new WsFrame.Ok(commandId, effectiveSid, seq);
             }
             case "error" -> {
+                long effectiveSid = sid >= 0 ? sid : (msg != null && msg.hasSid ? msg.sid : -1);
                 return new WsFrame.ErrorFrame(
-                        commandId,
+                        commandId, effectiveSid, seq,
                         msg == null ? null : msg.code,
                         msg == null ? null : msg.message);
             }

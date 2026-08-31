@@ -24,13 +24,23 @@ class WsCommandsTest {
     }
 
     @Test
-    @DisplayName("get_snapshot is the in-place gap repair, scoped to one sid")
+    @DisplayName("get_snapshot MUST carry market_tickers or Kalshi rejects it with code 14")
     void getSnapshot() {
-        String json = WsCommands.getSnapshot(1002, 3);
+        // Sending only sids + action returns
+        // {"type":"error","seq":N,"msg":{"code":14,"msg":"Market Ticker required"}}, which meant
+        // gap recovery had never actually worked. Found by replaying an archive and tracing
+        // phantom sequence gaps back to our own rejected requests.
+        String json = WsCommands.getSnapshot(1002, 3, List.of(
+                MarketTicker.of("KXHIGHNY-26SEP01-T83"),
+                MarketTicker.of("KXHIGHNY-26SEP01-T90")));
 
         assertThat(json).isEqualTo(
                 "{\"id\":1002,\"cmd\":\"update_subscription\",\"params\":{"
-                        + "\"sids\":[3],\"action\":\"get_snapshot\"}}");
+                        + "\"sids\":[3],"
+                        + "\"market_tickers\":[\"KXHIGHNY-26SEP01-T83\","
+                        + "\"KXHIGHNY-26SEP01-T90\"],"
+                        + "\"action\":\"get_snapshot\"}}");
+        assertThat(json).contains("market_tickers");
     }
 
     @Test

@@ -144,14 +144,29 @@ public sealed interface WsFrame {
     /**
      * A command-level error.
      *
+     * <p><b>Error frames occupy sequence numbers.</b> Observed live:
+     * {@code {"type":"error","sid":1,"seq":1261,"msg":{"code":14,...}}}. So an error is
+     * {@link Sequenced} and must advance the counter, exactly like {@link Ok} — treating it as
+     * unsequenced makes the next delta look like it skipped a frame. This is the second frame
+     * type to hold a seq without changing a book, which is why the rule to apply is "anything
+     * carrying a seq advances the counter", not a list of known types.
+     *
      * @param commandId the {@code id} echoed from our command, or -1
+     * @param sid       the subscription, or -1
+     * @param seq       the sequence number if present, else -1
      * @param code      Kalshi error code, as exact wire text
      * @param message   human message
      */
-    record ErrorFrame(long commandId, String code, String message) implements WsFrame {
+    record ErrorFrame(long commandId, long sid, long seq, String code, String message)
+            implements Sequenced {
+
         @Override
         public String type() {
             return "error";
+        }
+
+        public boolean hasSeq() {
+            return seq >= 0;
         }
     }
 
