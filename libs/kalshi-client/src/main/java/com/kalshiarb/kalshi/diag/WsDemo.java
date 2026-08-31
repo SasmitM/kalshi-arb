@@ -167,6 +167,10 @@ public final class WsDemo {
                                 rb.replay().size(), rb.discardedStale(),
                                 rb.stillGapped(), rb.abandonedAfterGap());
                     }
+                    case SnapshotRecovery.Outcome.SequenceOnly so -> System.out.printf(
+                            "[%s] seq-only sid=%d seq=%d (%s) -- counter advanced, no book "
+                                    + "change%n",
+                            stamp(), so.sid(), so.seq(), so.frameType());
                     case SnapshotRecovery.Outcome.Ignored ig -> System.out.printf(
                             "[%s] ignored sid=%d seq=%d: %s%n",
                             stamp(), ig.sid(), ig.seq(), ig.reason());

@@ -297,6 +297,94 @@ class SnapshotRecoveryTest {
         assertThat(recovery.bufferDepth(SID)).isZero();
     }
 
+    private static WsFrame.Ok ok(long seq) {
+        return new WsFrame.Ok(1000 + seq, SID, seq);
+    }
+
+    @Test
+    @DisplayName("an ok frame advances the counter without touching a book")
+    void okAdvancesSequence() {
+        recovery.onFrame(snapshot(10));
+
+        SnapshotRecovery.Outcome outcome = recovery.onFrame(ok(11));
+
+        assertThat(outcome).isInstanceOf(SnapshotRecovery.Outcome.SequenceOnly.class);
+        assertThat(sequences.lastSeq(SID)).isEqualTo(11);
+        // The following delta is in order precisely because the ok was counted.
+        assertThat(recovery.onFrame(delta(12)))
+                .isInstanceOf(SnapshotRecovery.Outcome.Apply.class);
+        assertThat(metrics.gapsDetected()).isZero();
+    }
+
+    @Test
+    @DisplayName("REGRESSION: ignoring an ok's seq would fake a gap on the next delta")
+    void okNotCountedWouldFakeGap() {
+        // Live shape: snapshots 1-6, then ok at 7, 8, 9, then snapshots from 10. If the ok
+        // seqs are not consumed, seq 10 looks like it skipped three frames.
+        recovery.onFrame(snapshot(6));
+        recovery.onFrame(ok(7));
+        recovery.onFrame(ok(8));
+        recovery.onFrame(ok(9));
+
+        assertThat(sequences.lastSeq(SID)).isEqualTo(9);
+        assertThat(recovery.onFrame(delta(10)))
+                .isInstanceOf(SnapshotRecovery.Outcome.Apply.class);
+        assertThat(metrics.gapsDetected())
+                .as("no gap: every sequence number between 6 and 10 was accounted for")
+                .isZero();
+    }
+
+    @Test
+    @DisplayName("a buffered ok is a marker, not a phantom hole in the replay run")
+    void bufferedOkIsNotAHole() {
+        recovery.onFrame(snapshot(10));
+        recovery.onFrame(delta(13)); // gap -> buffers 13
+        recovery.onFrame(ok(14));    // buffered as a marker
+        recovery.onFrame(delta(15));
+
+        SnapshotRecovery.Outcome.Rebuild rebuild =
+                (SnapshotRecovery.Outcome.Rebuild) recovery.onFrame(snapshot(12));
+
+        // 13, 14, 15 are contiguous above 12 -- 14 just contributes nothing to replay.
+        assertThat(rebuild.replay()).extracting(WsFrame.Delta::seq).containsExactly(13L, 15L);
+        assertThat(rebuild.stillGapped())
+                .as("the ok at 14 accounts for that number, so there is no hole")
+                .isFalse();
+        assertThat(sequences.lastSeq(SID)).isEqualTo(15);
+    }
+
+    @Test
+    @DisplayName("a trailing buffered ok is included in the new baseline")
+    void trailingOkAdvancesBaseline() {
+        recovery.onFrame(snapshot(10));
+        recovery.onFrame(delta(12)); // gap
+        recovery.onFrame(ok(13));
+
+        SnapshotRecovery.Outcome.Rebuild rebuild =
+                (SnapshotRecovery.Outcome.Rebuild) recovery.onFrame(snapshot(11));
+
+        assertThat(rebuild.replay()).extracting(WsFrame.Delta::seq).containsExactly(12L);
+        // Baseline is 13, not 12: the ok consumed a number after the last replayed delta.
+        assertThat(sequences.lastSeq(SID)).isEqualTo(13);
+        assertThat(recovery.onFrame(delta(14)))
+                .isInstanceOf(SnapshotRecovery.Outcome.Apply.class);
+    }
+
+    @Test
+    @DisplayName("an ok can itself expose a gap and trigger recovery")
+    void okCanExposeGap() {
+        recovery.onFrame(snapshot(10));
+
+        SnapshotRecovery.Outcome outcome = recovery.onFrame(ok(15));
+
+        assertThat(outcome).isInstanceOf(SnapshotRecovery.Outcome.RequestSnapshot.class);
+        SnapshotRecovery.Outcome.RequestSnapshot req =
+                (SnapshotRecovery.Outcome.RequestSnapshot) outcome;
+        assertThat(req.expectedSeq()).isEqualTo(11);
+        assertThat(req.observedSeq()).isEqualTo(15);
+        assertThat(recovery.state(SID)).isEqualTo(SnapshotRecovery.State.AWAITING_SNAPSHOT);
+    }
+
     @Test
     @DisplayName("the buffer is bounded and drops oldest first")
     void bufferIsBounded() {

@@ -27,12 +27,25 @@ public sealed interface WsFrame {
      *
      * <p>Both a snapshot and a delta advance the same counter, so recovery has to reason about
      * them together rather than treating snapshots as out-of-band.
+     *
+     * <p>Crucially this includes {@link Ok}, which carries a {@code seq} but is not a book
+     * change. Confirmed live: three subscribe acks consumed seq 7, 8 and 9 in the middle of a
+     * snapshot burst. Anything holding a seq must advance the counter or the tracker reports a
+     * gap that never happened.
      */
     sealed interface Sequenced extends WsFrame {
         long sid();
 
         long seq();
+    }
 
+    /**
+     * A sequenced frame that actually changes a book, and therefore names a market.
+     *
+     * <p>Separated from {@link Sequenced} so a control frame can occupy a sequence number
+     * without having to invent a ticker for it.
+     */
+    sealed interface BookFrame extends Sequenced {
         MarketTicker ticker();
     }
 
@@ -49,7 +62,7 @@ public sealed interface WsFrame {
     record Snapshot(
             long sid, long seq, MarketTicker ticker,
             List<com.kalshiarb.model.PriceLevel> yesBids,
-            List<com.kalshiarb.model.PriceLevel> noBids) implements Sequenced {
+            List<com.kalshiarb.model.PriceLevel> noBids) implements BookFrame {
 
         public Snapshot {
             yesBids = List.copyOf(yesBids);
@@ -80,7 +93,7 @@ public sealed interface WsFrame {
      */
     record Delta(
             long sid, long seq, MarketTicker ticker, Side side, Price price,
-            long deltaMicroContracts) implements Sequenced {
+            long deltaMicroContracts) implements BookFrame {
 
         @Override
         public String type() {
@@ -128,18 +141,18 @@ public sealed interface WsFrame {
      * {@code subscribed}, and every later {@code subscribe} or {@code update_subscription} on
      * that channel is answered with {@code ok}.
      *
-     * <p>{@link #seq} is captured because {@code ok} frames appear to sit <b>inside</b> the
-     * sequence stream — a live run showed snapshot seqs 1-6, 8-13, 15-20, 22-27 with exactly
-     * three {@code ok} frames, which accounts for the missing 7, 14 and 21. If that holds,
-     * treating {@code ok} as unsequenced makes {@link SequenceTracker} report a false gap at
-     * every subscribe ack. Left un-wired into recovery until the raw frame confirms it, rather
-     * than guessing twice.
+     * <p><b>{@code ok} frames sit inside the sequence stream.</b> Confirmed live:
+     * {@code ok id=1007 sid=1 seq=7}, {@code seq=8}, {@code seq=9}, landing between the
+     * snapshot bursts for consecutive shards. So an {@code ok} must advance the sequence
+     * counter even though it changes no book — otherwise the tracker reports a gap at every
+     * subscribe ack and triggers a pointless resnapshot. This is why {@code Ok} is
+     * {@link Sequenced} but not a {@link BookFrame}.
      *
      * @param commandId the {@code id} echoed from our command, or -1
      * @param sid       the subscription this concerns, or -1
      * @param seq       the sequence number if the frame carries one, else -1
      */
-    record Ok(long commandId, long sid, long seq) implements WsFrame {
+    record Ok(long commandId, long sid, long seq) implements Sequenced {
 
         @Override
         public String type() {

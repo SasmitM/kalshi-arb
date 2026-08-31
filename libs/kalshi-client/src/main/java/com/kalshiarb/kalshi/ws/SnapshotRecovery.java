@@ -99,6 +99,13 @@ public final class SnapshotRecovery {
                 int abandonedAfterGap) implements Outcome {
         }
 
+        /**
+         * A control frame occupied a sequence number. The counter advanced; there is nothing to
+         * apply to any book.
+         */
+        record SequenceOnly(long sid, long seq, String frameType) implements Outcome {
+        }
+
         /** Frame ignored, with the reason. Duplicates land here. */
         record Ignored(long sid, long seq, String reason) implements Outcome {
         }
@@ -112,7 +119,16 @@ public final class SnapshotRecovery {
 
     private final SequenceTracker sequences;
     private final Map<Long, State> states = new HashMap<>();
-    private final Map<Long, List<WsFrame.Delta>> buffers = new HashMap<>();
+
+    /**
+     * Held frames, keyed by sid.
+     *
+     * <p>Holds every {@link WsFrame.Sequenced}, not just deltas. A control frame such as
+     * {@code ok} consumes a sequence number without changing a book, so if the buffer tracked
+     * only deltas the contiguity walk in {@link #onSnapshot} would see a hole wherever an
+     * {@code ok} had been and declare a gap that does not exist.
+     */
+    private final Map<Long, List<WsFrame.Sequenced>> buffers = new HashMap<>();
     private final WsMetrics metrics;
 
     public SnapshotRecovery(SequenceTracker sequences, WsMetrics metrics, int maxBufferedPerSid) {
@@ -133,15 +149,47 @@ public final class SnapshotRecovery {
     }
 
     public int bufferDepth(long sid) {
-        List<WsFrame.Delta> buffer = buffers.get(sid);
+        List<WsFrame.Sequenced> buffer = buffers.get(sid);
         return buffer == null ? 0 : buffer.size();
     }
 
     /** Offers one sequenced frame and returns the action to take. */
     public Outcome onFrame(WsFrame.Sequenced frame) {
-        return frame instanceof WsFrame.Snapshot snapshot
-                ? onSnapshot(snapshot)
-                : onDelta((WsFrame.Delta) frame);
+        return switch (frame) {
+            case WsFrame.Snapshot snapshot -> onSnapshot(snapshot);
+            case WsFrame.Delta delta -> onDelta(delta);
+            // Control frames: they hold a seq but touch no book.
+            case WsFrame.Ok ok -> onControl(ok);
+        };
+    }
+
+    /**
+     * A sequenced frame that is not a book change.
+     *
+     * <p>It still has to advance the counter. Skipping it would make the next real delta look
+     * like it had skipped a frame.
+     */
+    private Outcome onControl(WsFrame.Sequenced control) {
+        long sid = control.sid();
+
+        if (state(sid) == State.AWAITING_SNAPSHOT) {
+            // Buffered as a marker only. It will never be replayed, but it keeps the
+            // contiguity walk honest about which sequence numbers are accounted for.
+            buffer(control);
+            return new Outcome.Buffered(sid, control.seq(), bufferDepth(sid));
+        }
+
+        SequenceTracker.Verdict verdict = sequences.observe(sid, control.seq());
+        return switch (verdict) {
+            case IN_ORDER, FIRST ->
+                    new Outcome.SequenceOnly(sid, control.seq(), control.type());
+            case DUPLICATE -> {
+                metrics.duplicateDropped();
+                yield new Outcome.Ignored(sid, control.seq(),
+                        "control frame at or below last " + sequences.lastSeq(sid));
+            }
+            case GAP -> beginRecovery(control);
+        };
     }
 
     /**
@@ -154,24 +202,25 @@ public final class SnapshotRecovery {
      */
     private Outcome onSnapshot(WsFrame.Snapshot snapshot) {
         long sid = snapshot.sid();
-        List<WsFrame.Delta> buffer = buffers.remove(sid);
+        List<WsFrame.Sequenced> buffer = buffers.remove(sid);
 
         int discardedStale = 0;
         List<WsFrame.Delta> replay = List.of();
         boolean stillGapped = false;
         int abandoned = 0;
+        long baseline = snapshot.seq();
 
         if (buffer != null && !buffer.isEmpty()) {
-            buffer.sort(Comparator.comparingLong(WsFrame.Delta::seq));
+            buffer.sort(Comparator.comparingLong(WsFrame.Sequenced::seq));
 
-            List<WsFrame.Delta> above = new ArrayList<>(buffer.size());
-            for (WsFrame.Delta d : buffer) {
+            List<WsFrame.Sequenced> above = new ArrayList<>(buffer.size());
+            for (WsFrame.Sequenced f : buffer) {
                 // The discard rule. Anything at or below the snapshot's seq is already
                 // reflected in it; replaying would apply the same delta twice.
-                if (d.seq() <= snapshot.seq()) {
+                if (f.seq() <= snapshot.seq()) {
                     discardedStale++;
                 } else {
-                    above.add(d);
+                    above.add(f);
                 }
             }
 
@@ -179,15 +228,20 @@ public final class SnapshotRecovery {
             // buffer itself has a hole -- entirely possible, since the frames that caused the
             // original gap may still be missing -- replaying past it would silently skip
             // updates. Stop at the hole and ask for another snapshot.
+            //
+            // A control frame at the expected seq advances the run without contributing
+            // anything to replay: the number is accounted for, so it is not a hole.
             List<WsFrame.Delta> contiguous = new ArrayList<>(above.size());
             long expected = snapshot.seq() + 1;
             int i = 0;
             for (; i < above.size(); i++) {
-                WsFrame.Delta d = above.get(i);
-                if (d.seq() == expected) {
-                    contiguous.add(d);
+                WsFrame.Sequenced f = above.get(i);
+                if (f.seq() == expected) {
+                    if (f instanceof WsFrame.Delta d) {
+                        contiguous.add(d);
+                    }
                     expected++;
-                } else if (d.seq() < expected) {
+                } else if (f.seq() < expected) {
                     discardedStale++;
                 } else {
                     break;
@@ -198,12 +252,12 @@ public final class SnapshotRecovery {
                 abandoned = above.size() - i;
             }
             replay = contiguous;
+            // expected - 1 rather than the last replayed delta's seq: a trailing control frame
+            // consumed a number too, and the baseline has to include it.
+            baseline = expected - 1;
         }
 
-        long newBaseline = replay.isEmpty()
-                ? snapshot.seq()
-                : replay.get(replay.size() - 1).seq();
-        sequences.resetTo(sid, newBaseline);
+        sequences.resetTo(sid, baseline);
 
         if (stillGapped) {
             // Straight back into recovery: we have a fresh book but a known hole ahead.
@@ -236,37 +290,46 @@ public final class SnapshotRecovery {
                         "seq " + delta.seq() + " at or below last " + sequences.lastSeq(sid));
             }
             case GAP -> {
-                long expected = sequences.lastSeq(sid) + 1;
-                long missing = sequences.gapSize(sid, delta.seq());
-
-                // Clear the buffer, exactly as the algorithm specifies, then hold the frame
-                // that exposed the gap: it is a delta we have not applied, and its seq may well
-                // be above the incoming snapshot's.
-                List<WsFrame.Delta> previous = buffers.remove(sid);
-                int discarded = previous == null ? 0 : previous.size();
-
-                states.put(sid, State.AWAITING_SNAPSHOT);
-                buffer(delta);
-
-                metrics.gapDetected(missing);
-                metrics.snapshotRequested();
-                return new Outcome.RequestSnapshot(
-                        sid, expected, delta.seq(), missing, discarded);
+                return beginRecovery(delta);
             }
             default -> throw new IllegalStateException("unhandled verdict " + verdict);
         }
     }
 
-    private void buffer(WsFrame.Delta delta) {
-        List<WsFrame.Delta> buffer =
-                buffers.computeIfAbsent(delta.sid(), k -> new ArrayList<>());
+    /**
+     * Enters recovery for the sid that {@code trigger} arrived on.
+     *
+     * <p>Shared by deltas and control frames, since either can be the frame that exposes a gap.
+     */
+    private Outcome beginRecovery(WsFrame.Sequenced trigger) {
+        long sid = trigger.sid();
+        long expected = sequences.lastSeq(sid) + 1;
+        long missing = sequences.gapSize(sid, trigger.seq());
+
+        // Clear the buffer, exactly as the algorithm specifies, then hold the frame that
+        // exposed the gap: it is unapplied data whose seq may well be above the incoming
+        // snapshot's.
+        List<WsFrame.Sequenced> previous = buffers.remove(sid);
+        int discarded = previous == null ? 0 : previous.size();
+
+        states.put(sid, State.AWAITING_SNAPSHOT);
+        buffer(trigger);
+
+        metrics.gapDetected(missing);
+        metrics.snapshotRequested();
+        return new Outcome.RequestSnapshot(sid, expected, trigger.seq(), missing, discarded);
+    }
+
+    private void buffer(WsFrame.Sequenced frame) {
+        List<WsFrame.Sequenced> buffer =
+                buffers.computeIfAbsent(frame.sid(), k -> new ArrayList<>());
         if (buffer.size() >= maxBufferedPerSid) {
             // Drop the oldest: a snapshot will supersede old deltas anyway, and the recent tail
             // is what still needs replaying.
             buffer.remove(0);
             metrics.bufferOverflowDropped();
         }
-        buffer.add(delta);
+        buffer.add(frame);
     }
 
     /** Forces a sid back into recovery, e.g. after a reconnect invalidates all books. */
