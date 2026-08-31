@@ -5,6 +5,7 @@ import com.kalshiarb.kalshi.auth.KalshiCredentials;
 import com.kalshiarb.kalshi.auth.KalshiSigner;
 import com.kalshiarb.kalshi.rest.KalshiRestClient;
 import com.kalshiarb.kalshi.rest.dto.MarketSummary;
+import com.kalshiarb.kalshi.ws.KalshiWsCluster;
 import com.kalshiarb.kalshi.ws.KalshiWsConnection;
 import com.kalshiarb.kalshi.ws.RawFrame;
 import com.kalshiarb.kalshi.ws.SnapshotRecovery;
@@ -22,15 +23,15 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.random.RandomGenerator;
 
 /**
- * Holds a live authenticated WebSocket, sharded by event family, and reports gaps, recoveries and
+ * Holds one live authenticated WebSocket per event family and reports gaps, recoveries and
  * reconnects. This is the runnable form of task 4's acceptance criterion.
  *
  * <p>Builds its watchlist from the public REST API — the open markets of the requested weather
  * series — so the tickers are always current rather than hardcoded to events that have settled.
  *
- * <p>Forces one reconnect partway through, because the reconnect path is the half of the
- * connection manager that ordinary uptime never exercises. A clean run shows books being
- * re-subscribed and every shard returning to STREAMING afterwards.
+ * <p>Forces a reconnect partway through, because the reconnect path is the half of the
+ * connection manager that ordinary uptime never exercises. A clean run shows every socket
+ * re-subscribing and returning to STREAMING afterwards.
  *
  * <p>Read-only. Subscribes to public book channels; the only reason credentials are needed at
  * all is that Kalshi authenticates the handshake itself.
@@ -75,18 +76,16 @@ public final class WsDemo {
         AtomicLong rebuilds = new AtomicLong();
         AtomicLong snapshots = new AtomicLong();
 
-        // Protocol reconnaissance. The WS field names are the one part of this client that
-        // could not be written against a captured payload, so the first frame of each type is
-        // dumped in full. That is how the yes_dollars_fp discrepancy was found, and it is still
-        // open whether `ok` frames occupy sequence numbers and whether a second sid ever
-        // appears. Bounded per type so a 30-minute run does not drown in raw JSON.
+        // Protocol reconnaissance, kept because it earned its place: dumping the first frame of
+        // each type is what found the yes_dollars_fp spelling, the ok-frames-carry-seq
+        // behaviour, and the one-sid-per-connection limit. Bounded per type so a long run does
+        // not drown in raw JSON.
         java.util.Set<String> dumpedTypes = java.util.concurrent.ConcurrentHashMap.newKeySet();
         AtomicLong deltasDumped = new AtomicLong();
         java.util.Set<Long> seenSids = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-        // If Kalshi assigns one sid per subscribe command, this many distinct sids should show
-        // up. A live run produced exactly one for four commands, which would mean sharding on a
-        // single connection buys no isolation at all. This makes the answer unmissable.
+        // Now that each family has its own socket, this many distinct sids should appear. If
+        // fewer show up, the per-connection isolation has silently regressed.
         int expectedShards = SubscriptionPlan.shardByEventFamily(watchlist).size();
 
         // Delivery latency from Kalshi's ts_ms against our local receive time. This is the
@@ -204,17 +203,19 @@ public final class WsDemo {
             }
         };
 
-        try (KalshiWsConnection ws = new KalshiWsConnection(
+        try (KalshiWsCluster ws = new KalshiWsCluster(
                 KalshiWsConnection.DEFAULT_WS_URL, signer, clock, watchlist, listener,
                 RandomGenerator.getDefault())) {
 
             System.out.printf("connecting to %s%n", KalshiWsConnection.DEFAULT_WS_URL);
             System.out.printf("signing path  %s%n", KalshiWsConnection.WS_SIGNING_PATH);
-            ws.start();
+            System.out.printf("one connection per event family: %d sockets%n",
+                    ws.shards().size());
             for (SubscriptionPlan.Shard shard : ws.shards()) {
-                System.out.printf("  shard cmd=%d %s (%d markets)%n",
-                        shard.commandId(), shard.family(), shard.size());
+                System.out.printf("  shard %s (%d markets)%n", shard.family(), shard.size());
             }
+            ws.start();
+            ws.describe().forEach(l -> System.out.println("  " + l));
 
             WsMetrics m = ws.metrics();
             long deadline = System.nanoTime() + Duration.ofMinutes(minutes).toNanos();
@@ -229,14 +230,14 @@ public final class WsDemo {
                     forced = true;
                     System.out.printf("%n[%s] ==== forcing a reconnect to exercise recovery "
                             + "====%n%n", stamp());
-                    ws.forceReconnect("scheduled drill");
+                    ws.forceReconnectAll("scheduled drill");
                 }
 
                 if (System.nanoTime() - lastReport > Duration.ofSeconds(30).toNanos()) {
                     lastReport = System.nanoTime();
-                    System.out.printf("[%s] %s | applied=%d buffered=%d rebuilds=%d state=%s%n",
-                            stamp(), m, applied.get(), buffered.get(), rebuilds.get(),
-                            ws.state());
+                    System.out.printf("[%s] %s | applied=%d buffered=%d rebuilds=%d%n",
+                            stamp(), m, applied.get(), buffered.get(), rebuilds.get());
+                    ws.describe().forEach(l -> System.out.println("    " + l));
                 }
             }
 
@@ -258,12 +259,9 @@ public final class WsDemo {
                 System.out.println("  no exchange timestamps seen -- latency not measurable "
                         + "from this run");
             }
-            System.out.printf("  distinct sids=%d for %d subscribed shards -> %s%n",
-                    seenSids.size(), expectedShards,
-                    seenSids.size() < expectedShards
-                            ? "SHARDING GIVES NO ISOLATION on one connection; a gap invalidates "
-                                    + "every market. Needs one connection per shard."
-                            : "one sid per shard, blast radius bounded as intended");
+            System.out.printf("  %d sockets, one per event family; per-socket sid:%n",
+                    ws.shards().size());
+            ws.describe().forEach(l -> System.out.println("    " + l));
             if (m.decodeFailures() > 0) {
                 System.out.printf("  WARNING: %d decode failures -- a wire field name is still "
                         + "wrong; do NOT start the recorder until this is zero%n",

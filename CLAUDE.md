@@ -309,13 +309,58 @@ every change.
 - Level going negative: **throw**. Never clamp to zero; that hides the bug.
 
 **`seq` is scoped to the subscription (`sid`), NOT to the market.** One
-dropped message invalidates every book on that subscription. Therefore:
-**shard subscriptions by event family** — NYC weather on one sid, Chicago on
-another — so a gap costs six markets instead of the whole watchlist.
+dropped message invalidates every book on that subscription.
 
-A useful side effect: each shard's books are then owned exclusively by one
-thread, and constraint groups never span shards. **No locks anywhere in the
-book layer.** Single-writer-per-shard is the entire concurrency model.
+**Corrected: Kalshi assigns one `sid` per CHANNEL per CONNECTION, not one per
+subscribe command.** Verified live — four `subscribe` commands for four event
+families on one socket all came back on `sid=1`, with `seq` running
+continuously 1→27 across every family, answered by one `subscribed` and three
+`ok`. So sending separate subscribe commands buys **no isolation at all**.
+
+Therefore: **one WebSocket connection per event family.** The sharding logic
+is unchanged, but it has to drive connections, not subscriptions. Cost is one
+socket + one pump thread + one watchdog thread per family; the guarantee is
+that a gap on the NYC socket cannot touch the LAX books.
+
+The side effect is now structural rather than aspirational: each family's
+books are touched by exactly one pump thread, and constraint groups never
+span families. **No locks anywhere in the book layer.**
+Single-writer-per-shard is the entire concurrency model.
+
+**`ok` frames occupy sequence numbers.** Verified: `ok id=1007 sid=1 seq=7`,
+`seq=8`, `seq=9`, landing between snapshot bursts. Anything holding a `seq`
+must advance the counter even when it changes no book, or the tracker reports
+a false gap at every subscribe ack and resnapshots for nothing. A buffered
+`ok` also has to count as an accounted-for number during gap replay, or the
+contiguity check sees a phantom hole.
+
+### Book frames carry a server timestamp — use it
+
+Every `orderbook_delta` includes:
+
+```json
+"ts": "2026-08-31T20:51:05.261155Z", "ts_ms": 1788209465261
+```
+
+`ts_ms` minus the local receive time is a **directly measured** one-way
+delivery latency. The latency study does not have to model delivery; it can
+report the real distribution. Carries clock skew between Kalshi's host and
+ours, so read it as a distribution, not a per-frame truth. Absent timestamps
+must be `-1`, never `0` — a 1970 epoch would silently poison the histogram.
+
+### WS field names differ from REST
+
+| Frame | Levels / price | Size |
+| --- | --- | --- |
+| WS `orderbook_snapshot` | `yes_dollars_fp`, `no_dollars_fp` | — |
+| WS `orderbook_delta` | `price_dollars` | `delta_fp` |
+| REST `/orderbook` | `yes_dollars`, `no_dollars` (inside `orderbook_fp`) | — |
+
+**The WS snapshot uses `_dollars_fp`; REST uses `_dollars`.** Assuming the
+REST spelling makes every snapshot fail to decode while deltas keep working —
+so the connection looks healthy and every book silently never initialises.
+Snapshots also carry a `market_id` UUID. Try each known spelling rather than
+assuming one, and throw listing the names tried if none match.
 
 Gap recovery (do not tear down the connection):
 

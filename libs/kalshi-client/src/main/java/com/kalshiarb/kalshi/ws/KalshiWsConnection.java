@@ -4,16 +4,11 @@ import com.kalshiarb.common.Backoff;
 import com.kalshiarb.common.Clock;
 import com.kalshiarb.kalshi.auth.AuthHeaders;
 import com.kalshiarb.kalshi.auth.KalshiSigner;
-import com.kalshiarb.model.MarketTicker;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletionStage;
@@ -23,45 +18,53 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.random.RandomGenerator;
 
 /**
- * Maintains one authenticated WebSocket to Kalshi, with sharded subscriptions, sequence-gap
- * recovery, and reconnection under exponential backoff with jitter.
+ * One authenticated WebSocket carrying exactly <b>one</b> shard — the markets of a single event
+ * family — with its own sequence tracking, gap recovery and reconnect schedule.
  *
- * <h2>Host</h2>
- * The WebSocket is <b>not</b> on the REST host. Verified by probing the upgrade request:
- * {@code external-api.kalshi.com/trade-api/ws/v2} returns a backend {@code 404 page not found}
- * on every path variant tried, while {@code api.elections.kalshi.com/trade-api/ws/v2} returns
- * {@code 401 token_authentication_failure} — an endpoint that exists and wants credentials.
- * CLAUDE.md's WS host was carried over from the REST base URL and is wrong.
+ * <h2>Why one shard per connection</h2>
+ * Because Kalshi assigns <b>one {@code sid} per channel per connection</b>, not one per
+ * subscribe command. Verified live: four {@code subscribe} commands for four event families on a
+ * single socket all came back on {@code sid=1}, with {@code seq} running continuously 1→27
+ * across every family, answered by one {@code subscribed} and three {@code ok}. Sending separate
+ * subscribe commands therefore buys <b>no isolation whatsoever</b> — a single dropped frame
+ * invalidates every market on the socket.
  *
- * <h2>Auth</h2>
- * The handshake is signed even though every channel used here is public market data. The signed
- * path is {@code /trade-api/ws/v2}, which is <b>not</b> the REST {@code /trade-api/v2} prefix —
- * signing the REST prefix produces a 401 with no other symptom.
+ * <p>Since {@code seq} is per-{@code sid} and there is only one {@code sid} per connection, the
+ * only way to bound a gap's blast radius to one constraint group is a separate connection per
+ * group. {@link KalshiWsCluster} owns the fan-out; this class stays deliberately single-shard.
+ *
+ * <p>A real benefit falls out: each connection has its own pump thread, its own
+ * {@link SequenceTracker} and its own {@link SnapshotRecovery}, so a shard's books are touched
+ * by exactly one thread. Single-writer-per-shard stops being an aspiration and becomes a
+ * structural property, which is what keeps locks out of the book layer.
+ *
+ * <h2>Host and auth</h2>
+ * The WebSocket is <b>not</b> on the REST host: {@code external-api.kalshi.com/trade-api/ws/v2}
+ * returns a backend {@code 404 page not found}, while
+ * {@code api.elections.kalshi.com/trade-api/ws/v2} returns {@code 401} — an endpoint that exists
+ * and wants credentials. The handshake is signed even though every channel here is public market
+ * data, and the signed path is {@code /trade-api/ws/v2}, <b>not</b> the REST
+ * {@code /trade-api/v2} prefix.
  *
  * <h2>Threading</h2>
- * Three threads, with one hard rule:
+ * Three threads per connection, with one hard rule:
  * <ol>
- *   <li>The <b>WebSocket callback thread</b> (JDK-owned) timestamps each completed frame and
- *       offers it to a bounded queue. It never parses, never writes, and never blocks. If it
- *       blocked, the connection's automatic Pong replies would stall with it and Kalshi would
- *       drop us.
- *   <li>The <b>pump thread</b> drains the queue, decodes, drives recovery, and calls the
- *       listener. Blocking here is fine.
- *   <li>The <b>watchdog thread</b> checks ping liveness and reconnects when the socket goes
- *       quiet.
+ *   <li>The <b>WebSocket callback thread</b> (JDK-owned) reassembles fragments, timestamps the
+ *       frame, and offers it to a bounded queue. It never parses, never writes, never blocks —
+ *       blocking it would stall the connection's automatic Pong replies too.
+ *   <li>The <b>pump thread</b> drains the queue, decodes, drives recovery, calls the listener.
+ *   <li>The <b>watchdog thread</b> reconnects when the socket goes silent.
  * </ol>
- * On queue overflow the frame is <b>dropped</b> and the drop counter incremented. That is
- * deliberate: a dropped frame produces a sequence gap, and gap recovery already knows how to
- * rebuild from a snapshot. Blocking to avoid the drop would trade a recoverable gap for a dead
- * connection.
+ * On queue overflow the frame is <b>dropped</b> and counted: a dropped frame becomes a sequence
+ * gap, and gap recovery already rebuilds from a snapshot. Blocking to avoid the drop would trade
+ * a recoverable gap for a dead connection.
  *
  * <h2>Ping/pong</h2>
- * No Pong is sent explicitly. The JDK's own javadoc states that "the WebSocket implementation
- * will automatically send a reciprocal pong when a ping is received", and {@code WebSocketImpl}
- * carries a {@code lastAutomaticPong} field to that effect. Sending our own would put a second,
- * unsolicited Pong on the wire. Ping arrival is instead used as a liveness signal: Kalshi pings
- * roughly every 10s, so a long silence means the connection is dead in a way that produces no
- * close frame.
+ * No Pong is sent explicitly — the JDK's javadoc states the implementation "will automatically
+ * send a reciprocal pong when a ping is received". Ping arrival is used only as a liveness
+ * signal. Note that a live two-minute run received <b>zero</b> pings, so CLAUDE.md's ~10s ping
+ * interval does not hold; the staleness check therefore keys off the last ping <i>or</i> frame,
+ * or a quiet market would trigger a false reconnect.
  */
 public final class KalshiWsConnection implements AutoCloseable {
 
@@ -72,17 +75,13 @@ public final class KalshiWsConnection implements AutoCloseable {
     public static final String WS_SIGNING_PATH = "/trade-api/ws/v2";
 
     /**
-     * Hand-off queue depth. Deep enough to absorb a burst of snapshots on subscribe, shallow
-     * enough that a stalled pump thread is caught by the drop counter rather than by an
-     * OutOfMemoryError.
+     * Hand-off queue depth. Deep enough to absorb the snapshot burst on subscribe, shallow
+     * enough that a stalled pump thread shows up as drops rather than an OutOfMemoryError.
      */
     private static final int QUEUE_CAPACITY = 65_536;
 
-    /**
-     * Kalshi pings about every 10s. Three missed intervals is a dead connection; shorter would
-     * churn on ordinary jitter.
-     */
-    private static final Duration PING_TIMEOUT = Duration.ofSeconds(35);
+    /** Silence longer than this means dead. Keyed off frames as well as pings. */
+    private static final Duration STALE_TIMEOUT = Duration.ofSeconds(35);
 
     private static final Duration WATCHDOG_INTERVAL = Duration.ofSeconds(5);
     private static final Duration HANDSHAKE_TIMEOUT = Duration.ofSeconds(20);
@@ -91,27 +90,23 @@ public final class KalshiWsConnection implements AutoCloseable {
     private final KalshiSigner signer;
     private final Clock clock;
     private final WsListener listener;
-    private final WsMetrics metrics = new WsMetrics();
+    private final WsMetrics metrics;
     private final WsFrameCodec codec = new WsFrameCodec();
     private final Backoff backoff;
-
-    private final List<MarketTicker> watchlist;
-    private final List<SubscriptionPlan.Shard> shards;
+    private final SubscriptionPlan.Shard shard;
 
     private final SequenceTracker sequences = new SequenceTracker();
     private final SnapshotRecovery recovery;
 
     private final BlockingQueue<RawFrame> queue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
     private final AtomicBoolean running = new AtomicBoolean();
+    private final AtomicBoolean reconnecting = new AtomicBoolean();
     private final AtomicLong lastPingNanos = new AtomicLong();
     private final AtomicLong lastFrameNanos = new AtomicLong();
     private final AtomicLong commandIds = new AtomicLong(1_000);
 
-    /** Maps our subscribe command id to the shard it was for, so acks can be attributed. */
-    private final Map<Long, SubscriptionPlan.Shard> shardByCommandId = new HashMap<>();
-
-    /** Maps an assigned sid to its shard. Written by the pump thread only. */
-    private final Map<Long, SubscriptionPlan.Shard> shardBySid = new HashMap<>();
+    /** The sid Kalshi assigned this connection. One per connection, by construction. */
+    private volatile long assignedSid = -1;
 
     private volatile WebSocket socket;
     private volatile String state = "NEW";
@@ -123,32 +118,42 @@ public final class KalshiWsConnection implements AutoCloseable {
             String wsUrl,
             KalshiSigner signer,
             Clock clock,
-            List<MarketTicker> watchlist,
+            SubscriptionPlan.Shard shard,
             WsListener listener,
+            WsMetrics metrics,
             RandomGenerator random) {
         this.wsUrl = wsUrl;
         this.signer = signer;
         this.clock = clock;
+        this.shard = shard;
         this.listener = listener;
-        this.watchlist = List.copyOf(watchlist);
-        this.shards = SubscriptionPlan.shardByEventFamily(this.watchlist);
+        this.metrics = metrics;
         this.recovery = new SnapshotRecovery(sequences, metrics);
         this.backoff = Backoff.forWebSocket(random);
+    }
+
+    public SubscriptionPlan.Shard shard() {
+        return shard;
     }
 
     public WsMetrics metrics() {
         return metrics;
     }
 
-    public List<SubscriptionPlan.Shard> shards() {
-        return shards;
-    }
-
     public String state() {
         return state;
     }
 
-    /** Starts the pump and watchdog threads and connects. Returns immediately. */
+    public long assignedSid() {
+        return assignedSid;
+    }
+
+    /** Recovery state for this connection's single sid. */
+    public SnapshotRecovery.State recoveryState() {
+        return recovery.state(assignedSid);
+    }
+
+    /** Starts the pump and watchdog threads and connects. Returns once connected. */
     public void start() {
         if (!running.compareAndSet(false, true)) {
             throw new IllegalStateException("already started");
@@ -157,11 +162,11 @@ public final class KalshiWsConnection implements AutoCloseable {
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
 
-        pumpThread = new Thread(this::pumpLoop, "kalshi-ws-pump");
-        pumpThread.setDaemon(false);
+        String name = shard.family().value();
+        pumpThread = new Thread(this::pumpLoop, "ws-pump-" + name);
         pumpThread.start();
 
-        watchdogThread = new Thread(this::watchdogLoop, "kalshi-ws-watchdog");
+        watchdogThread = new Thread(this::watchdogLoop, "ws-watchdog-" + name);
         watchdogThread.setDaemon(true);
         watchdogThread.start();
 
@@ -193,38 +198,28 @@ public final class KalshiWsConnection implements AutoCloseable {
     private void connectOnce() throws Exception {
         transition("CONNECTING", "dialing " + wsUrl);
 
-        // Sign the WS path, not the REST prefix.
         AuthHeaders headers = signer.sign("GET", WS_SIGNING_PATH);
 
-        WebSocket.Builder builder = http.newWebSocketBuilder()
+        socket = http.newWebSocketBuilder()
                 .connectTimeout(HANDSHAKE_TIMEOUT)
                 .header(AuthHeaders.HEADER_ACCESS_KEY, headers.accessKey())
                 .header(AuthHeaders.HEADER_TIMESTAMP, headers.timestamp())
-                .header(AuthHeaders.HEADER_SIGNATURE, headers.signature());
-
-        socket = builder.buildAsync(URI.create(wsUrl), new Handler())
+                .header(AuthHeaders.HEADER_SIGNATURE, headers.signature())
+                .buildAsync(URI.create(wsUrl), new Handler())
                 .get(HANDSHAKE_TIMEOUT.toSeconds() + 5, TimeUnit.SECONDS);
 
         long now = clock.nanoTime();
         lastPingNanos.set(now);
         lastFrameNanos.set(now);
 
-        // Every book is invalid across a reconnect: sids are not stable and the sequence
-        // baseline is gone. Force every shard back into AWAITING_SNAPSHOT before subscribing.
+        // Books do not survive a reconnect: the sid is reassigned and the sequence baseline is
+        // gone. Force recovery before subscribing.
         recovery.invalidateAll();
-        shardBySid.clear();
-        shardByCommandId.clear();
+        assignedSid = -1;
 
         transition("CONNECTED", "handshake accepted");
-
-        for (SubscriptionPlan.Shard shard : shards) {
-            long id = commandIds.incrementAndGet();
-            SubscriptionPlan.Shard withId =
-                    new SubscriptionPlan.Shard(shard.family(), shard.markets(), id);
-            shardByCommandId.put(id, withId);
-            send(WsCommands.subscribe(id, shard.markets()));
-        }
-        transition("SUBSCRIBED", shards.size() + " shards, " + watchlist.size() + " markets");
+        send(WsCommands.subscribe(commandIds.incrementAndGet(), shard.markets()));
+        transition("SUBSCRIBED", shard.family() + " (" + shard.size() + " markets)");
     }
 
     private void send(String json) {
@@ -232,22 +227,17 @@ public final class KalshiWsConnection implements AutoCloseable {
         if (ws == null) {
             throw new IllegalStateException("not connected");
         }
-        // sendText is asynchronous; the JDK serialises writes internally.
         ws.sendText(json, true);
     }
 
     // ------------------------------------------------------------------ WS callbacks
 
-    /**
-     * Runs on the JDK's WebSocket callback thread. Does the minimum possible: reassemble
-     * fragments, timestamp, enqueue.
-     */
     private final class Handler implements WebSocket.Listener {
 
         /**
          * Accumulates message fragments. {@code onText} is called once per fragment with
          * {@code last=false} until the final one, and a JSON frame split across fragments would
-         * fail to parse — a subtle bug that only shows up on large snapshots.
+         * fail to parse — which only shows up on large snapshots.
          */
         private final StringBuilder partial = new StringBuilder(4096);
 
@@ -263,13 +253,12 @@ public final class KalshiWsConnection implements AutoCloseable {
                 String json = partial.toString();
                 partial.setLength(0);
 
-                // Timestamp before anything else touches the frame.
+                // Timestamp before anything else touches the frame, so the recorded receive
+                // time excludes our own decode cost.
                 RawFrame frame = new RawFrame(json, clock.currentTimeMillis(), clock.nanoTime());
                 lastFrameNanos.set(frame.receivedAtNanos());
                 metrics.frameReceived(frame.sizeBytes());
 
-                // offer(), never put(): blocking here would stall the connection. A drop
-                // becomes a sequence gap, and gap recovery handles that.
                 if (!queue.offer(frame)) {
                     metrics.frameDropped();
                 }
@@ -280,8 +269,7 @@ public final class KalshiWsConnection implements AutoCloseable {
 
         @Override
         public CompletionStage<?> onPing(WebSocket webSocket, ByteBuffer message) {
-            // No explicit Pong: the JDK sends a reciprocal one automatically. This is purely a
-            // liveness observation.
+            // No explicit Pong: the JDK sends a reciprocal one automatically.
             lastPingNanos.set(clock.nanoTime());
             metrics.pingReceived();
             webSocket.request(1);
@@ -320,10 +308,9 @@ public final class KalshiWsConnection implements AutoCloseable {
                 Thread.currentThread().interrupt();
                 return;
             }
-            if (frame == null) {
-                continue;
+            if (frame != null) {
+                handle(frame);
             }
-            handle(frame);
         }
     }
 
@@ -334,7 +321,7 @@ public final class KalshiWsConnection implements AutoCloseable {
         try {
             decoded = codec.decode(frame.json());
         } catch (RuntimeException e) {
-            // A single malformed frame must not kill the connection.
+            // One malformed frame must not kill the connection.
             metrics.decodeFailure();
             listener.onDecodeFailure(frame, e);
             return;
@@ -343,21 +330,27 @@ public final class KalshiWsConnection implements AutoCloseable {
         listener.onFrame(decoded, frame);
 
         if (decoded instanceof WsFrame.Subscribed sub) {
-            SubscriptionPlan.Shard shard = shardByCommandId.get(sub.commandId());
-            if (shard != null && sub.sid() >= 0) {
-                shardBySid.put(sub.sid(), shard);
-                transition(state, "sid " + sub.sid() + " -> " + shard.family()
-                        + " (" + shard.size() + " markets)");
+            if (sub.sid() >= 0) {
+                assignedSid = sub.sid();
+                transition(state, "sid " + sub.sid() + " -> " + shard.family());
             }
             return;
         }
 
         if (decoded instanceof WsFrame.Sequenced sequenced) {
+            // An Ok carrying no seq is a bare acknowledgement, not part of the stream.
+            if (sequenced instanceof WsFrame.Ok ok && !ok.hasSeq()) {
+                return;
+            }
+            if (assignedSid < 0 && sequenced.sid() >= 0) {
+                assignedSid = sequenced.sid();
+            }
+
             SnapshotRecovery.Outcome outcome = recovery.onFrame(sequenced);
             listener.onRecoveryOutcome(outcome);
 
-            // Recovery decides; the connection only performs the I/O it asks for. Critically,
-            // neither branch reconnects -- a gap is repaired in place.
+            // Recovery decides; the connection only performs the I/O it asks for. Neither
+            // branch reconnects — a gap is repaired in place.
             if (outcome instanceof SnapshotRecovery.Outcome.RequestSnapshot request) {
                 requestSnapshot(request.sid());
             } else if (outcome instanceof SnapshotRecovery.Outcome.Rebuild rebuild
@@ -371,7 +364,6 @@ public final class KalshiWsConnection implements AutoCloseable {
         try {
             send(WsCommands.getSnapshot(commandIds.incrementAndGet(), sid));
         } catch (RuntimeException e) {
-            // If the socket is already gone the watchdog/onClose path will reconnect.
             transition(state, "get_snapshot for sid " + sid + " failed: " + e);
         }
     }
@@ -380,34 +372,28 @@ public final class KalshiWsConnection implements AutoCloseable {
 
     private void watchdogLoop() {
         while (running.get()) {
-            if (!sleepMillis(WATCHDOG_INTERVAL.toMillis())) {
+            if (!sleepMillis(WATCHDOG_INTERVAL.toMillis()) || !running.get()) {
                 return;
             }
-            if (!running.get()) {
-                return;
-            }
-            WebSocket ws = socket;
-            if (ws == null) {
+            if (socket == null) {
                 continue;
             }
-            long quietNanos = clock.nanoTime() - Math.max(lastPingNanos.get(),
-                    lastFrameNanos.get());
-            if (quietNanos > PING_TIMEOUT.toNanos()) {
-                // No close frame, no error, just silence. Treat as dead.
+            long quiet = clock.nanoTime()
+                    - Math.max(lastPingNanos.get(), lastFrameNanos.get());
+            if (quiet > STALE_TIMEOUT.toNanos()) {
+                // No close frame, no error, just silence.
                 transition("STALE", "no ping or frame for "
-                        + TimeUnit.NANOSECONDS.toSeconds(quietNanos) + "s");
-                scheduleReconnect("ping timeout");
+                        + TimeUnit.NANOSECONDS.toSeconds(quiet) + "s");
+                scheduleReconnect("stale");
             }
         }
     }
-
-    private final AtomicBoolean reconnecting = new AtomicBoolean();
 
     private void scheduleReconnect(String reason) {
         if (!running.get()) {
             return;
         }
-        // onClose and the watchdog can both fire for the same failure; only one reconnect.
+        // onClose, onError and the watchdog can all fire for one failure; reconnect once.
         if (!reconnecting.compareAndSet(false, true)) {
             return;
         }
@@ -423,7 +409,7 @@ public final class KalshiWsConnection implements AutoCloseable {
             } finally {
                 reconnecting.set(false);
             }
-        }, "kalshi-ws-reconnect");
+        }, "ws-reconnect-" + shard.family().value());
         t.setDaemon(true);
         t.start();
     }
@@ -433,14 +419,13 @@ public final class KalshiWsConnection implements AutoCloseable {
         socket = null;
         if (ws != null) {
             // abort(), not sendClose(): the socket is already broken, and a graceful close
-            // handshake would just block on a peer that is not answering.
+            // handshake would block on a peer that is not answering.
             ws.abort();
         }
     }
 
     /** Forces a reconnect. Used to exercise the reconnect path deliberately. */
     public void forceReconnect(String reason) {
-        transition(state, "forced reconnect: " + reason);
         scheduleReconnect("forced: " + reason);
     }
 
@@ -486,12 +471,5 @@ public final class KalshiWsConnection implements AutoCloseable {
             http.close();
         }
         transition("STOPPED", "closed by caller");
-    }
-
-    /** Drains and discards anything queued. For tests. */
-    List<RawFrame> drainQueue() {
-        List<RawFrame> drained = new ArrayList<>();
-        queue.drainTo(drained);
-        return drained;
     }
 }
