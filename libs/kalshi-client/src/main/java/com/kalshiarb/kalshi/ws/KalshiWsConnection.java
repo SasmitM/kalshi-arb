@@ -263,7 +263,8 @@ public final class KalshiWsConnection implements AutoCloseable {
 
                 // Timestamp before anything else touches the frame, so the recorded receive
                 // time excludes our own decode cost.
-                RawFrame frame = new RawFrame(json, clock.currentTimeMillis(), clock.nanoTime());
+                RawFrame frame = new RawFrame(
+                        shard.family(), json, clock.currentTimeMillis(), clock.nanoTime());
                 lastFrameNanos.set(frame.receivedAtNanos());
                 metrics.frameReceived(frame.sizeBytes());
 
