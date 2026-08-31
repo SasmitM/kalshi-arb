@@ -6,7 +6,11 @@ plugins {
 }
 
 subprojects {
-    apply(plugin = "java")
+    // java-library, not plain java: the layers need `api` so that a value type declared in
+    // core-model and exposed in a layer-1 signature is visible to a layer-3 caller. With plain
+    // `implementation` everywhere, apps/recorder could call a method returning a Price without
+    // being able to name Price.
+    apply(plugin = "java-library")
 
     group = "com.kalshiarb"
     version = "0.1.0"
