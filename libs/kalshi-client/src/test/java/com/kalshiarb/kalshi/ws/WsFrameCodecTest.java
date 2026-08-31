@@ -14,6 +14,81 @@ class WsFrameCodecTest {
     private final WsFrameCodec codec = new WsFrameCodec();
 
     @Test
+    @DisplayName("decodes a real live snapshot: yes_dollars_fp, market_id, both suffixes")
+    void liveSnapshotFieldNames() {
+        // Captured verbatim from the first live socket run. The field names are
+        // yes_dollars_fp / no_dollars_fp -- NOT the yes_dollars that the REST orderbook
+        // endpoint uses inside orderbook_fp. Assuming the REST spelling made every snapshot
+        // fail to decode while deltas kept working, which is a nasty failure mode: books
+        // silently never initialise.
+        String json = """
+                {"type":"orderbook_snapshot","sid":2,"seq":4,"msg":{
+                  "market_ticker":"KXHIGHNY-26SEP01-B89.5",
+                  "market_id":"f447cb57-f3de-44d8-a984-5ec80259928e",
+                  "yes_dollars_fp":[["0.0100","869.79"]],
+                  "no_dollars_fp":[["0.0100","569.00"],["0.0200","20.00"],
+                                   ["0.0300","183.00"]]}}""";
+
+        WsFrame.Snapshot snap = (WsFrame.Snapshot) codec.decode(json);
+
+        assertThat(snap.sid()).isEqualTo(2);
+        assertThat(snap.seq()).isEqualTo(4);
+        assertThat(snap.ticker().value()).isEqualTo("KXHIGHNY-26SEP01-B89.5");
+        assertThat(snap.yesBids()).hasSize(1);
+        assertThat(snap.yesBids().get(0).quantity().toContractString()).isEqualTo("869.79");
+        assertThat(snap.noBids()).hasSize(3);
+        assertThat(snap.noBids().get(2).price()).isEqualTo(Price.ofCents(3));
+    }
+
+    @Test
+    @DisplayName("a snapshot with only no_dollars_fp decodes with an empty yes side")
+    void liveOneSidedSnapshot() {
+        // KXHIGHNY-26SEP01-T90 really does have no YES bids.
+        String json = """
+                {"type":"orderbook_snapshot","sid":2,"seq":6,"msg":{
+                  "market_ticker":"KXHIGHNY-26SEP01-T90",
+                  "market_id":"f399c488-064b-466c-9c28-87075c27e5d3",
+                  "no_dollars_fp":[["0.0100","519.00"],["0.0200","20.00"]]}}""";
+
+        WsFrame.Snapshot snap = (WsFrame.Snapshot) codec.decode(json);
+
+        assertThat(snap.yesBids()).isEmpty();
+        assertThat(snap.noBids()).hasSize(2);
+    }
+
+    @Test
+    @DisplayName("_dollars_fp wins over the REST-style _dollars spelling")
+    void dollarsFpPreferredOverDollars() {
+        String json = """
+                {"type":"orderbook_snapshot","sid":1,"seq":1,"msg":{
+                  "market_ticker":"KXHIGHNY-26SEP01-T83",
+                  "yes_dollars":[["0.4000","1.00"]],
+                  "yes_dollars_fp":[["0.4500","2.00"]],
+                  "no_dollars_fp":[]}}""";
+
+        WsFrame.Snapshot snap = (WsFrame.Snapshot) codec.decode(json);
+
+        assertThat(snap.yesBids().get(0).price()).isEqualTo(Price.ofCents(45));
+    }
+
+    @Test
+    @DisplayName("an ok frame reports whether it carries a seq")
+    void okFrame() {
+        // Whether ok frames sit inside the sequence stream decides if the tracker sees false
+        // gaps at every subscribe ack. Both shapes must be distinguishable.
+        WsFrame.Ok withSeq = (WsFrame.Ok) codec.decode("""
+                {"type":"ok","id":1002,"sid":2,"seq":7}""");
+        assertThat(withSeq.hasSeq()).isTrue();
+        assertThat(withSeq.seq()).isEqualTo(7);
+        assertThat(withSeq.sid()).isEqualTo(2);
+
+        WsFrame.Ok withoutSeq = (WsFrame.Ok) codec.decode("""
+                {"type":"ok","id":1002,"sid":2}""");
+        assertThat(withoutSeq.hasSeq()).isFalse();
+        assertThat(withoutSeq.seq()).isEqualTo(-1);
+    }
+
+    @Test
     @DisplayName("decodes a fixed-point snapshot")
     void fixedPointSnapshot() {
         String json = """
@@ -194,13 +269,16 @@ class WsFrameCodecTest {
                 {"type":"orderbook_delta","sid":1,"seq":1,"msg":{
                   "market_ticker":"KXHIGHNY-26SEP01-T83","side":"yes"}}"""))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("neither price_dollars nor price");
+                .hasMessageContaining("no recognised price field");
 
         assertThatThrownBy(() -> codec.decode("""
                 {"type":"orderbook_snapshot","sid":1,"seq":1,"msg":{
                   "market_ticker":"KXHIGHNY-26SEP01-T83"}}"""))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("neither yes_dollars/no_dollars nor yes/no");
+                // The message must list what was tried; that is what made the real
+                // yes_dollars_fp mismatch diagnosable from one log line.
+                .hasMessageContaining("no recognised level fields")
+                .hasMessageContaining("yes_dollars_fp");
     }
 
     @Test

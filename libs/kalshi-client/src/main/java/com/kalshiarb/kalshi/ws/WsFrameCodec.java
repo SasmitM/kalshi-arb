@@ -26,25 +26,31 @@ import java.util.List;
  * key order works. That costs one short-lived object per frame and buys immunity to an ordering
  * assumption nothing in the protocol guarantees.
  *
- * <p><b>Both wire representations are accepted.</b> Kalshi is mid-migration and CLAUDE.md
- * records that it returns legacy integers and fixed-point strings side by side. For book frames
- * that means:
+ * <p><b>Field names differ between frame types, and the snapshot names are not the REST ones.</b>
+ * Confirmed against a live socket on 2026-08-31:
  *
  * <ul>
- *   <li>fixed-point: {@code yes_dollars}/{@code no_dollars} as {@code [["0.4500","100.00"]]},
- *       {@code price_dollars}, {@code delta_fp}
- *   <li>legacy: {@code yes}/{@code no} as {@code [[45,100]]}, {@code price}, {@code delta},
- *       where price is in <b>whole cents</b> and count in <b>whole contracts</b>
+ *   <li>{@code orderbook_snapshot} carries <b>{@code yes_dollars_fp}</b> /
+ *       <b>{@code no_dollars_fp}</b> — note both suffixes — as
+ *       {@code [["0.0100","1281.00"]]}. The REST orderbook endpoint uses {@code yes_dollars}
+ *       inside {@code orderbook_fp}, so the two surfaces genuinely disagree. An earlier version
+ *       of this codec assumed the REST spelling and failed to decode every snapshot.
+ *   <li>{@code orderbook_snapshot} also carries a {@code market_id} UUID, which is skipped.
  * </ul>
  *
- * Fixed-point wins when both are present, per the standing rule that the {@code _dollars} and
- * {@code _fp} fields are authoritative.
+ * Every known spelling is therefore tried in order rather than assumed:
+ * {@code yes_dollars_fp} then {@code yes_dollars} then legacy {@code yes}; for deltas
+ * {@code price_dollars_fp} then {@code price_dollars} then legacy {@code price}. Fixed-point
+ * always wins over legacy, since legacy prices are whole cents and cannot represent a sub-penny
+ * level.
  *
- * <p><b>The exact WS field names are unverified against a live socket.</b> The handshake requires
- * authentication, so they could not be observed while building this. They follow the REST
- * payloads and the documented protocol; the first live connection must confirm them, and
- * {@link #decode} throws a message naming the offending frame rather than guessing if it sees a
- * book frame with neither representation.
+ * <p>Legacy form, for reference: {@code yes}/{@code no} as {@code [[45,100]]}, {@code price},
+ * {@code delta} — price in <b>whole cents</b>, count in <b>whole contracts</b>.
+ *
+ * <p>A book frame matching none of the spellings throws with the frame text and the list of
+ * names tried, rather than silently producing an empty book. That is what surfaced the
+ * {@code _dollars_fp} discrepancy in the first two hundred milliseconds of the first live run
+ * instead of after a day of recording.
  *
  * <p>Stateless and thread-safe.
  */
@@ -58,11 +64,15 @@ public final class WsFrameCodec {
         String channel;
         String side;
 
-        // Fixed-point forms.
+        // Fixed-point forms, in descending order of preference. Kalshi is inconsistent between
+        // frame types, so each name is tried rather than assumed -- see the class javadoc.
+        List<PriceLevel> yesDollarsFp;
+        List<PriceLevel> noDollarsFp;
+        List<PriceLevel> yesDollars;
+        List<PriceLevel> noDollars;
+        String priceDollarsFp;
         String priceDollars;
         String deltaFp;
-        List<PriceLevel> yesFp;
-        List<PriceLevel> noFp;
 
         // Legacy integer forms.
         boolean hasLegacyPrice;
@@ -78,6 +88,25 @@ public final class WsFrameCodec {
 
         boolean hasSid;
         long sid;
+
+        /** First non-null of the fixed-point spellings, then the legacy form. */
+        List<PriceLevel> yesLevels() {
+            return firstNonNull(yesDollarsFp, yesDollars, yesLegacy);
+        }
+
+        List<PriceLevel> noLevels() {
+            return firstNonNull(noDollarsFp, noDollars, noLegacy);
+        }
+
+        @SafeVarargs
+        private static <T> T firstNonNull(T... candidates) {
+            for (T c : candidates) {
+                if (c != null) {
+                    return c;
+                }
+            }
+            return null;
+        }
     }
 
     /**
@@ -128,12 +157,13 @@ public final class WsFrameCodec {
                 // sid/seq sometimes live in the envelope and sometimes in msg; prefer the
                 // envelope and fall back, rather than requiring one shape.
                 long effectiveSid = sid >= 0 ? sid : (m.hasSid ? m.sid : -1);
-                List<PriceLevel> yes = m.yesFp != null ? m.yesFp : m.yesLegacy;
-                List<PriceLevel> no = m.noFp != null ? m.noFp : m.noLegacy;
+                List<PriceLevel> yes = m.yesLevels();
+                List<PriceLevel> no = m.noLevels();
                 if (yes == null && no == null) {
                     throw new IllegalArgumentException(
-                            "orderbook_snapshot has neither yes_dollars/no_dollars nor "
-                                    + "yes/no: " + preview(json));
+                            "orderbook_snapshot has no recognised level fields (tried "
+                                    + "yes_dollars_fp/no_dollars_fp, yes_dollars/no_dollars, "
+                                    + "yes/no): " + preview(json));
                 }
                 return new WsFrame.Snapshot(
                         effectiveSid, seq, tickerOf(m, type, json),
@@ -148,14 +178,18 @@ public final class WsFrameCodec {
                             "orderbook_delta has no side: " + preview(json));
                 }
                 Price price;
-                if (m.priceDollars != null) {
+                if (m.priceDollarsFp != null) {
+                    price = Price.fromFixedPointString(m.priceDollarsFp);
+                } else if (m.priceDollars != null) {
                     price = Price.fromFixedPointString(m.priceDollars);
                 } else if (m.hasLegacyPrice) {
-                    // Legacy prices are whole cents.
+                    // Legacy prices are whole cents, so this branch cannot represent a
+                    // sub-penny level. Reaching it on a live feed means precision is being lost.
                     price = Price.ofCents(m.legacyPriceCents);
                 } else {
                     throw new IllegalArgumentException(
-                            "orderbook_delta has neither price_dollars nor price: "
+                            "orderbook_delta has no recognised price field (tried "
+                                    + "price_dollars_fp, price_dollars, price): "
                                     + preview(json));
                 }
                 long deltaMicros;
@@ -167,7 +201,8 @@ public final class WsFrameCodec {
                     deltaMicros = Math.multiplyExact(m.legacyDeltaContracts, FixedPoint.ONE);
                 } else {
                     throw new IllegalArgumentException(
-                            "orderbook_delta has neither delta_fp nor delta: " + preview(json));
+                            "orderbook_delta has no recognised size field (tried delta_fp, "
+                                    + "delta_dollars_fp, delta): " + preview(json));
                 }
                 return new WsFrame.Delta(
                         effectiveSid, seq, tickerOf(m, type, json),
@@ -177,6 +212,10 @@ public final class WsFrameCodec {
                 long effectiveSid = sid >= 0 ? sid : (msg != null && msg.hasSid ? msg.sid : -1);
                 return new WsFrame.Subscribed(
                         commandId, effectiveSid, msg == null ? null : msg.channel);
+            }
+            case "ok" -> {
+                long effectiveSid = sid >= 0 ? sid : (msg != null && msg.hasSid ? msg.sid : -1);
+                return new WsFrame.Ok(commandId, effectiveSid, seq);
             }
             case "error" -> {
                 return new WsFrame.ErrorFrame(
@@ -222,10 +261,14 @@ public final class WsFrameCodec {
                     m.sid = p.getValueAsLong();
                     m.hasSid = true;
                 }
+                case "price_dollars_fp" -> m.priceDollarsFp = p.getValueAsString();
                 case "price_dollars" -> m.priceDollars = p.getValueAsString();
-                case "delta_fp" -> m.deltaFp = p.getValueAsString();
-                case "yes_dollars" -> m.yesFp = readFixedPointLevels(p);
-                case "no_dollars" -> m.noFp = readFixedPointLevels(p);
+                case "delta_fp", "delta_dollars_fp" -> m.deltaFp = p.getValueAsString();
+                // Observed live on orderbook_snapshot.
+                case "yes_dollars_fp" -> m.yesDollarsFp = readFixedPointLevels(p);
+                case "no_dollars_fp" -> m.noDollarsFp = readFixedPointLevels(p);
+                case "yes_dollars" -> m.yesDollars = readFixedPointLevels(p);
+                case "no_dollars" -> m.noDollars = readFixedPointLevels(p);
                 case "price" -> {
                     m.legacyPriceCents = p.getValueAsLong();
                     m.hasLegacyPrice = true;

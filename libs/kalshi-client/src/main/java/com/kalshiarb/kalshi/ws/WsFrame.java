@@ -122,6 +122,36 @@ public sealed interface WsFrame {
     }
 
     /**
+     * Acknowledgement of a command other than the first {@code subscribe} on a channel.
+     *
+     * <p>Observed live: the first {@code subscribe} for a channel is answered with
+     * {@code subscribed}, and every later {@code subscribe} or {@code update_subscription} on
+     * that channel is answered with {@code ok}.
+     *
+     * <p>{@link #seq} is captured because {@code ok} frames appear to sit <b>inside</b> the
+     * sequence stream — a live run showed snapshot seqs 1-6, 8-13, 15-20, 22-27 with exactly
+     * three {@code ok} frames, which accounts for the missing 7, 14 and 21. If that holds,
+     * treating {@code ok} as unsequenced makes {@link SequenceTracker} report a false gap at
+     * every subscribe ack. Left un-wired into recovery until the raw frame confirms it, rather
+     * than guessing twice.
+     *
+     * @param commandId the {@code id} echoed from our command, or -1
+     * @param sid       the subscription this concerns, or -1
+     * @param seq       the sequence number if the frame carries one, else -1
+     */
+    record Ok(long commandId, long sid, long seq) implements WsFrame {
+
+        @Override
+        public String type() {
+            return "ok";
+        }
+
+        public boolean hasSeq() {
+            return seq >= 0;
+        }
+    }
+
+    /**
      * Any frame this client does not model.
      *
      * <p>Deliberately not an exception: Kalshi adding a frame type must not take the recorder
