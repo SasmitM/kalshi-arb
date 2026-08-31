@@ -89,6 +89,11 @@ public final class WsFrameCodec {
         boolean hasSid;
         long sid;
 
+        // Kalshi's own send timestamp. Observed on every delta as ts_ms (epoch millis)
+        // alongside a human-readable ts. This is what makes delivery latency measurable
+        // instead of modelled, so it is carried through rather than skipped.
+        long tsMillis = -1;
+
         /** First non-null of the fixed-point spellings, then the legacy form. */
         List<PriceLevel> yesLevels() {
             return firstNonNull(yesDollarsFp, yesDollars, yesLegacy);
@@ -168,7 +173,8 @@ public final class WsFrameCodec {
                 return new WsFrame.Snapshot(
                         effectiveSid, seq, tickerOf(m, type, json),
                         yes == null ? List.of() : yes,
-                        no == null ? List.of() : no);
+                        no == null ? List.of() : no,
+                        m.tsMillis);
             }
             case "orderbook_delta" -> {
                 Msg m = require(msg, type, json);
@@ -206,7 +212,7 @@ public final class WsFrameCodec {
                 }
                 return new WsFrame.Delta(
                         effectiveSid, seq, tickerOf(m, type, json),
-                        Side.fromWireName(m.side), price, deltaMicros);
+                        Side.fromWireName(m.side), price, deltaMicros, m.tsMillis);
             }
             case "subscribed" -> {
                 long effectiveSid = sid >= 0 ? sid : (msg != null && msg.hasSid ? msg.sid : -1);
@@ -261,6 +267,7 @@ public final class WsFrameCodec {
                     m.sid = p.getValueAsLong();
                     m.hasSid = true;
                 }
+                case "ts_ms" -> m.tsMillis = p.getValueAsLong(-1L);
                 case "price_dollars_fp" -> m.priceDollarsFp = p.getValueAsString();
                 case "price_dollars" -> m.priceDollars = p.getValueAsString();
                 case "delta_fp", "delta_dollars_fp" -> m.deltaFp = p.getValueAsString();

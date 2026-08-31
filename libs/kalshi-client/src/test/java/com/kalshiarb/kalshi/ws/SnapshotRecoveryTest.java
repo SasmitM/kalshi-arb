@@ -38,11 +38,13 @@ class SnapshotRecoveryTest {
     private static WsFrame.Snapshot snapshot(long seq) {
         return new WsFrame.Snapshot(SID, seq, TICKER,
                 List.of(new PriceLevel(Price.ofCents(50), Quantity.ofContracts(10))),
-                List.of(new PriceLevel(Price.ofCents(48), Quantity.ofContracts(10))));
+                List.of(new PriceLevel(Price.ofCents(48), Quantity.ofContracts(10))),
+                -1L);
     }
 
     private static WsFrame.Delta delta(long seq) {
-        return new WsFrame.Delta(SID, seq, TICKER, Side.YES, Price.ofCents(50), 1_000_000L);
+        return new WsFrame.Delta(
+                SID, seq, TICKER, Side.YES, Price.ofCents(50), 1_000_000L, -1L);
     }
 
     @Test
@@ -268,7 +270,8 @@ class SnapshotRecoveryTest {
         MarketTicker otherTicker = MarketTicker.of("KXHIGHLAX-26SEP01-T83");
 
         recovery.onFrame(snapshot(10));
-        recovery.onFrame(new WsFrame.Snapshot(otherSid, 100, otherTicker, List.of(), List.of()));
+        recovery.onFrame(
+                new WsFrame.Snapshot(otherSid, 100, otherTicker, List.of(), List.of(), -1L));
 
         // Gap on SID only.
         recovery.onFrame(delta(13));
@@ -277,7 +280,7 @@ class SnapshotRecoveryTest {
         assertThat(recovery.state(otherSid)).isEqualTo(SnapshotRecovery.State.STREAMING);
 
         WsFrame.Delta otherDelta = new WsFrame.Delta(
-                otherSid, 101, otherTicker, Side.NO, Price.ofCents(40), -500_000L);
+                otherSid, 101, otherTicker, Side.NO, Price.ofCents(40), -500_000L, -1L);
         assertThat(recovery.onFrame(otherDelta))
                 .isInstanceOf(SnapshotRecovery.Outcome.Apply.class);
         assertThat(sequences.lastSeq(otherSid)).isEqualTo(101);

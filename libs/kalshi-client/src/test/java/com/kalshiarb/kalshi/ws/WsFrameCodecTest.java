@@ -72,6 +72,40 @@ class WsFrameCodecTest {
     }
 
     @Test
+    @DisplayName("a real live delta: price_dollars/delta_fp plus the server ts_ms")
+    void liveDeltaWithTimestamp() {
+        // Captured verbatim. Confirms deltas take the fixed-point branch, not the lossy legacy
+        // whole-cents one, and that Kalshi stamps each frame server-side.
+        String json = """
+                {"type":"orderbook_delta","sid":1,"seq":28,"msg":{
+                  "market_ticker":"KXHIGHLAX-26SEP01-B76.5",
+                  "market_id":"78a9ab48-fcf5-4b06-afdd-f6bfc4c7e6c8",
+                  "price_dollars":"0.3900","delta_fp":"0.33","side":"yes",
+                  "ts":"2026-08-31T20:51:05.261155Z","ts_ms":1788209465261}}""";
+
+        WsFrame.Delta d = (WsFrame.Delta) codec.decode(json);
+
+        assertThat(d.price()).isEqualTo(Price.ofCents(39));
+        // A fractional delta of 0.33 contracts, which whole-contract legacy could not express.
+        assertThat(d.deltaMicroContracts()).isEqualTo(330_000L);
+        assertThat(d.hasExchangeTimestamp()).isTrue();
+        assertThat(d.exchangeTimestampMillis()).isEqualTo(1_788_209_465_261L);
+    }
+
+    @Test
+    @DisplayName("a frame without ts_ms reports no exchange timestamp rather than epoch zero")
+    void absentTimestampIsNegativeOne() {
+        WsFrame.Delta d = (WsFrame.Delta) codec.decode("""
+                {"type":"orderbook_delta","sid":1,"seq":2,"msg":{
+                  "market_ticker":"KXHIGHNY-26SEP01-T83","side":"yes",
+                  "price_dollars":"0.4500","delta_fp":"1.00"}}""");
+
+        // 0 would be 1970 and would silently poison any latency histogram.
+        assertThat(d.exchangeTimestampMillis()).isEqualTo(-1L);
+        assertThat(d.hasExchangeTimestamp()).isFalse();
+    }
+
+    @Test
     @DisplayName("an ok frame reports whether it carries a seq")
     void okFrame() {
         // Whether ok frames sit inside the sequence stream decides if the tracker sees false

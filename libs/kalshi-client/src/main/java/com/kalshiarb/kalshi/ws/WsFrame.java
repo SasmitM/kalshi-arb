@@ -47,6 +47,24 @@ public sealed interface WsFrame {
      */
     sealed interface BookFrame extends Sequenced {
         MarketTicker ticker();
+
+        /**
+         * Kalshi's own {@code ts_ms} for this frame, or -1 when absent.
+         *
+         * <p>Observed on every {@code orderbook_delta}:
+         * {@code "ts":"2026-08-31T20:51:05.261155Z","ts_ms":1788209465261}.
+         *
+         * <p>This is the measurement the project exists to produce. Subtracting it from
+         * {@link RawFrame#receivedAtMillis()} gives a real one-way delivery latency per frame,
+         * rather than the modelled estimate the latency study would otherwise have to assume.
+         * Note it is the exchange's clock against ours, so it carries any clock skew between
+         * the two — useful as a distribution, not as an exact per-frame figure.
+         */
+        long exchangeTimestampMillis();
+
+        default boolean hasExchangeTimestamp() {
+            return exchangeTimestampMillis() >= 0;
+        }
     }
 
     /**
@@ -58,11 +76,13 @@ public sealed interface WsFrame {
      * @param ticker  the market
      * @param yesBids resting YES bids
      * @param noBids  resting NO bids
+     * @param exchangeTimestampMillis Kalshi's {@code ts_ms}, or -1 if absent
      */
     record Snapshot(
             long sid, long seq, MarketTicker ticker,
             List<com.kalshiarb.model.PriceLevel> yesBids,
-            List<com.kalshiarb.model.PriceLevel> noBids) implements BookFrame {
+            List<com.kalshiarb.model.PriceLevel> noBids,
+            long exchangeTimestampMillis) implements BookFrame {
 
         public Snapshot {
             yesBids = List.copyOf(yesBids);
@@ -90,10 +110,11 @@ public sealed interface WsFrame {
      * @param side                which bid book the level lives on
      * @param price               the level price
      * @param deltaMicroContracts signed size change, in micro-contracts
+     * @param exchangeTimestampMillis Kalshi's {@code ts_ms}, or -1 if absent
      */
     record Delta(
             long sid, long seq, MarketTicker ticker, Side side, Price price,
-            long deltaMicroContracts) implements BookFrame {
+            long deltaMicroContracts, long exchangeTimestampMillis) implements BookFrame {
 
         @Override
         public String type() {

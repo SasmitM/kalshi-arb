@@ -89,6 +89,14 @@ public final class WsDemo {
         // single connection buys no isolation at all. This makes the answer unmissable.
         int expectedShards = SubscriptionPlan.shardByEventFamily(watchlist).size();
 
+        // Delivery latency from Kalshi's ts_ms against our local receive time. This is the
+        // headline number the project is meant to produce, so it gets reported even from a
+        // two-minute diagnostic run.
+        AtomicLong latencyCount = new AtomicLong();
+        AtomicLong latencySumMillis = new AtomicLong();
+        AtomicLong latencyMinMillis = new AtomicLong(Long.MAX_VALUE);
+        AtomicLong latencyMaxMillis = new AtomicLong(Long.MIN_VALUE);
+
         WsListener listener = new WsListener() {
             @Override
             public void onStateChange(String from, String to, String reason) {
@@ -114,6 +122,16 @@ public final class WsDemo {
                     }
                     case WsFrame.Delta d -> {
                         noteSid(d.sid());
+                        // Real delivery latency: exchange send time vs local receive time.
+                        // Carries clock skew between the two machines, so it is worth reading
+                        // as a distribution rather than a per-frame truth.
+                        if (d.hasExchangeTimestamp()) {
+                            long lag = raw.receivedAtMillis() - d.exchangeTimestampMillis();
+                            latencyCount.incrementAndGet();
+                            latencySumMillis.addAndGet(lag);
+                            latencyMinMillis.accumulateAndGet(lag, Math::min);
+                            latencyMaxMillis.accumulateAndGet(lag, Math::max);
+                        }
                         // A few deltas in full: needed to tell whether the fixed-point or the
                         // legacy integer branch is being taken. The legacy branch is whole
                         // cents and would be silently losing sub-penny prices.
@@ -228,6 +246,18 @@ public final class WsDemo {
             System.out.printf("  applied=%d buffered=%d rebuilds=%d snapshots=%d%n",
                     applied.get(), buffered.get(), rebuilds.get(), snapshots.get());
             System.out.printf("  reconnects=%d (expected >= 1 from the drill)%n", m.reconnects());
+            if (latencyCount.get() > 0) {
+                System.out.printf("  delivery latency over %d deltas: mean %.1f ms, "
+                                + "min %d ms, max %d ms  (exchange ts_ms -> local receive)%n",
+                        latencyCount.get(),
+                        latencySumMillis.get() / (double) latencyCount.get(),
+                        latencyMinMillis.get(), latencyMaxMillis.get());
+                System.out.println("    includes clock skew between Kalshi's host and this "
+                        + "machine; a negative min means our clock runs behind theirs.");
+            } else {
+                System.out.println("  no exchange timestamps seen -- latency not measurable "
+                        + "from this run");
+            }
             System.out.printf("  distinct sids=%d for %d subscribed shards -> %s%n",
                     seenSids.size(), expectedShards,
                     seenSids.size() < expectedShards
