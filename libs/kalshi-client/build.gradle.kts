@@ -29,6 +29,19 @@ tasks.register<JavaExec>("smokeCheck") {
             ?.let { environment("KALSHI_PRIVATE_KEY", it) }
 }
 
+tasks.register<JavaExec>("wsDemo") {
+    group = "verification"
+    description = "Holds a live sharded WebSocket, logging gaps, recoveries and reconnects. " +
+        "Requires KALSHI_KEY_ID. Args: [minutes] [forceReconnectAfterMinutes] [series...]"
+    mainClass.set("com.kalshiarb.kalshi.diag.WsDemo")
+    classpath = sourceSets["main"].runtimeClasspath
+    providers.environmentVariable("KALSHI_KEY_ID").orNull
+            ?.let { environment("KALSHI_KEY_ID", it) }
+    providers.environmentVariable("KALSHI_PRIVATE_KEY").orNull
+            ?.let { environment("KALSHI_PRIVATE_KEY", it) }
+    // ./gradlew wsDemo --args="30 10 KXHIGHNY KXHIGHLAX"
+}
+
 tasks.register<JavaExec>("orderbookDemo") {
     group = "verification"
     description = "Prints live books for one event with derived asks, spreads and the " +

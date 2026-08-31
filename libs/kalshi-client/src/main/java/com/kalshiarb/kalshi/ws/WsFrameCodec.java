@@ -1,0 +1,295 @@
+package com.kalshiarb.kalshi.ws;
+
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
+import com.kalshiarb.model.FixedPoint;
+import com.kalshiarb.model.MarketTicker;
+import com.kalshiarb.model.Price;
+import com.kalshiarb.model.PriceLevel;
+import com.kalshiarb.model.Quantity;
+import com.kalshiarb.model.Side;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * Decodes WebSocket frames with Jackson's streaming {@link JsonParser}.
+ *
+ * <p>This is the hot path — one frame per book change, continuously — so there is no
+ * {@code readTree} and no databind here. The envelope is walked once, token by token.
+ *
+ * <p><b>Field order is not assumed.</b> A naive streaming decoder dispatches on {@code type} and
+ * then parses {@code msg}, which breaks if {@code msg} arrives first. Instead the {@code msg}
+ * object is drained into a small scratch holder and the frame is assembled afterwards, so any
+ * key order works. That costs one short-lived object per frame and buys immunity to an ordering
+ * assumption nothing in the protocol guarantees.
+ *
+ * <p><b>Both wire representations are accepted.</b> Kalshi is mid-migration and CLAUDE.md
+ * records that it returns legacy integers and fixed-point strings side by side. For book frames
+ * that means:
+ *
+ * <ul>
+ *   <li>fixed-point: {@code yes_dollars}/{@code no_dollars} as {@code [["0.4500","100.00"]]},
+ *       {@code price_dollars}, {@code delta_fp}
+ *   <li>legacy: {@code yes}/{@code no} as {@code [[45,100]]}, {@code price}, {@code delta},
+ *       where price is in <b>whole cents</b> and count in <b>whole contracts</b>
+ * </ul>
+ *
+ * Fixed-point wins when both are present, per the standing rule that the {@code _dollars} and
+ * {@code _fp} fields are authoritative.
+ *
+ * <p><b>The exact WS field names are unverified against a live socket.</b> The handshake requires
+ * authentication, so they could not be observed while building this. They follow the REST
+ * payloads and the documented protocol; the first live connection must confirm them, and
+ * {@link #decode} throws a message naming the offending frame rather than guessing if it sees a
+ * book frame with neither representation.
+ *
+ * <p>Stateless and thread-safe.
+ */
+public final class WsFrameCodec {
+
+    private static final JsonFactory FACTORY = new JsonFactory();
+
+    /** Mutable scratch for one {@code msg} object. Never escapes {@link #decode}. */
+    private static final class Msg {
+        String marketTicker;
+        String channel;
+        String side;
+
+        // Fixed-point forms.
+        String priceDollars;
+        String deltaFp;
+        List<PriceLevel> yesFp;
+        List<PriceLevel> noFp;
+
+        // Legacy integer forms.
+        boolean hasLegacyPrice;
+        long legacyPriceCents;
+        boolean hasLegacyDelta;
+        long legacyDeltaContracts;
+        List<PriceLevel> yesLegacy;
+        List<PriceLevel> noLegacy;
+
+        // Error payload.
+        String code;
+        String message;
+
+        boolean hasSid;
+        long sid;
+    }
+
+    /**
+     * Decodes one complete text frame.
+     *
+     * @throws IllegalArgumentException if the JSON is malformed or a book frame carries neither
+     *                                a fixed-point nor a legacy representation
+     */
+    public WsFrame decode(String json) {
+        try (JsonParser p = FACTORY.createParser(json)) {
+            if (p.nextToken() != JsonToken.START_OBJECT) {
+                throw new IllegalArgumentException("frame is not a JSON object: " + preview(json));
+            }
+
+            String type = null;
+            long sid = -1;
+            long seq = -1;
+            long commandId = -1;
+            Msg msg = null;
+
+            while (p.nextToken() == JsonToken.FIELD_NAME) {
+                String field = p.currentName();
+                p.nextToken();
+                switch (field) {
+                    case "type" -> type = p.getValueAsString();
+                    case "sid" -> sid = p.getValueAsLong();
+                    case "seq" -> seq = p.getValueAsLong();
+                    case "id" -> commandId = p.getValueAsLong();
+                    case "msg" -> msg = readMsg(p);
+                    default -> p.skipChildren();
+                }
+            }
+
+            if (type == null) {
+                throw new IllegalArgumentException("frame has no type field: " + preview(json));
+            }
+            return assemble(type, sid, seq, commandId, msg, json);
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot parse WS frame: " + preview(json), e);
+        }
+    }
+
+    private WsFrame assemble(
+            String type, long sid, long seq, long commandId, Msg msg, String json) {
+        switch (type) {
+            case "orderbook_snapshot" -> {
+                Msg m = require(msg, type, json);
+                // sid/seq sometimes live in the envelope and sometimes in msg; prefer the
+                // envelope and fall back, rather than requiring one shape.
+                long effectiveSid = sid >= 0 ? sid : (m.hasSid ? m.sid : -1);
+                List<PriceLevel> yes = m.yesFp != null ? m.yesFp : m.yesLegacy;
+                List<PriceLevel> no = m.noFp != null ? m.noFp : m.noLegacy;
+                if (yes == null && no == null) {
+                    throw new IllegalArgumentException(
+                            "orderbook_snapshot has neither yes_dollars/no_dollars nor "
+                                    + "yes/no: " + preview(json));
+                }
+                return new WsFrame.Snapshot(
+                        effectiveSid, seq, tickerOf(m, type, json),
+                        yes == null ? List.of() : yes,
+                        no == null ? List.of() : no);
+            }
+            case "orderbook_delta" -> {
+                Msg m = require(msg, type, json);
+                long effectiveSid = sid >= 0 ? sid : (m.hasSid ? m.sid : -1);
+                if (m.side == null) {
+                    throw new IllegalArgumentException(
+                            "orderbook_delta has no side: " + preview(json));
+                }
+                Price price;
+                if (m.priceDollars != null) {
+                    price = Price.fromFixedPointString(m.priceDollars);
+                } else if (m.hasLegacyPrice) {
+                    // Legacy prices are whole cents.
+                    price = Price.ofCents(m.legacyPriceCents);
+                } else {
+                    throw new IllegalArgumentException(
+                            "orderbook_delta has neither price_dollars nor price: "
+                                    + preview(json));
+                }
+                long deltaMicros;
+                if (m.deltaFp != null) {
+                    // Signed: a negative delta is a cancel, fill, or expiry.
+                    deltaMicros = FixedPoint.parseMicros(m.deltaFp);
+                } else if (m.hasLegacyDelta) {
+                    // Legacy counts are whole contracts.
+                    deltaMicros = Math.multiplyExact(m.legacyDeltaContracts, FixedPoint.ONE);
+                } else {
+                    throw new IllegalArgumentException(
+                            "orderbook_delta has neither delta_fp nor delta: " + preview(json));
+                }
+                return new WsFrame.Delta(
+                        effectiveSid, seq, tickerOf(m, type, json),
+                        Side.fromWireName(m.side), price, deltaMicros);
+            }
+            case "subscribed" -> {
+                long effectiveSid = sid >= 0 ? sid : (msg != null && msg.hasSid ? msg.sid : -1);
+                return new WsFrame.Subscribed(
+                        commandId, effectiveSid, msg == null ? null : msg.channel);
+            }
+            case "error" -> {
+                return new WsFrame.ErrorFrame(
+                        commandId,
+                        msg == null ? null : msg.code,
+                        msg == null ? null : msg.message);
+            }
+            default -> {
+                return new WsFrame.Unhandled(type);
+            }
+        }
+    }
+
+    private static Msg require(Msg msg, String type, String json) {
+        if (msg == null) {
+            throw new IllegalArgumentException(type + " has no msg object: " + preview(json));
+        }
+        return msg;
+    }
+
+    private static MarketTicker tickerOf(Msg m, String type, String json) {
+        if (m.marketTicker == null || m.marketTicker.isBlank()) {
+            throw new IllegalArgumentException(
+                    type + " has no market_ticker: " + preview(json));
+        }
+        return MarketTicker.of(m.marketTicker);
+    }
+
+    private Msg readMsg(JsonParser p) throws IOException {
+        if (p.currentToken() != JsonToken.START_OBJECT) {
+            p.skipChildren();
+            return null;
+        }
+        Msg m = new Msg();
+        while (p.nextToken() == JsonToken.FIELD_NAME) {
+            String field = p.currentName();
+            p.nextToken();
+            switch (field) {
+                case "market_ticker" -> m.marketTicker = p.getValueAsString();
+                case "channel" -> m.channel = p.getValueAsString();
+                case "side" -> m.side = p.getValueAsString();
+                case "sid" -> {
+                    m.sid = p.getValueAsLong();
+                    m.hasSid = true;
+                }
+                case "price_dollars" -> m.priceDollars = p.getValueAsString();
+                case "delta_fp" -> m.deltaFp = p.getValueAsString();
+                case "yes_dollars" -> m.yesFp = readFixedPointLevels(p);
+                case "no_dollars" -> m.noFp = readFixedPointLevels(p);
+                case "price" -> {
+                    m.legacyPriceCents = p.getValueAsLong();
+                    m.hasLegacyPrice = true;
+                }
+                case "delta" -> {
+                    m.legacyDeltaContracts = p.getValueAsLong();
+                    m.hasLegacyDelta = true;
+                }
+                case "yes" -> m.yesLegacy = readLegacyLevels(p);
+                case "no" -> m.noLegacy = readLegacyLevels(p);
+                // Kalshi's error payload nests the human text under "msg" again.
+                case "code" -> m.code = p.getValueAsString();
+                case "message", "msg" -> m.message = p.getValueAsString();
+                default -> p.skipChildren();
+            }
+        }
+        return m;
+    }
+
+    /** {@code [["0.4500","100.00"], ...]} */
+    private static List<PriceLevel> readFixedPointLevels(JsonParser p) throws IOException {
+        if (p.currentToken() != JsonToken.START_ARRAY) {
+            p.skipChildren();
+            return List.of();
+        }
+        List<PriceLevel> levels = new ArrayList<>();
+        while (p.nextToken() == JsonToken.START_ARRAY) {
+            p.nextToken();
+            String price = p.getValueAsString();
+            p.nextToken();
+            String count = p.getValueAsString();
+            // Tolerate extra elements rather than assuming exactly two.
+            while (p.nextToken() != JsonToken.END_ARRAY) {
+                p.skipChildren();
+            }
+            levels.add(PriceLevel.fromFixedPointStrings(price, count));
+        }
+        return levels;
+    }
+
+    /** Legacy {@code [[45, 100], ...]} — whole cents, whole contracts. */
+    private static List<PriceLevel> readLegacyLevels(JsonParser p) throws IOException {
+        if (p.currentToken() != JsonToken.START_ARRAY) {
+            p.skipChildren();
+            return List.of();
+        }
+        List<PriceLevel> levels = new ArrayList<>();
+        while (p.nextToken() == JsonToken.START_ARRAY) {
+            p.nextToken();
+            long cents = p.getValueAsLong();
+            p.nextToken();
+            long contracts = p.getValueAsLong();
+            while (p.nextToken() != JsonToken.END_ARRAY) {
+                p.skipChildren();
+            }
+            levels.add(new PriceLevel(Price.ofCents(cents), Quantity.ofContracts(contracts)));
+        }
+        return levels;
+    }
+
+    private static String preview(String json) {
+        if (json == null) {
+            return "<null>";
+        }
+        return json.length() <= 300 ? json : json.substring(0, 300) + "... (truncated)";
+    }
+}

@@ -141,12 +141,30 @@ Later additions: `libs/persistence`, `libs/universe`, `libs/execution`,
 
 ```
 REST  https://external-api.kalshi.com/trade-api/v2
-WS    wss://external-api.kalshi.com/trade-api/ws/v2   (verify host in docs)
+WS    wss://api.elections.kalshi.com/trade-api/ws/v2
 ```
+
+**REST and WS are on different hosts.** Verified by probing the upgrade
+request (2026-08-31):
+
+| Host | `/trade-api/ws/v2` | `/trade-api/v2/exchange/status` |
+| --- | --- | --- |
+| `external-api.kalshi.com` | **404** `404 page not found` | 200 |
+| `api.elections.kalshi.com` | **401** `token_authentication_failure` | 200 |
+| `trading-api.kalshi.com` | — | 401 (stale, from blogs) |
+
+The 404 is a backend response, not CloudFront, and every path variant tried
+on `external-api` 404s. The 401 on `api.elections` is the *good* answer: the
+endpoint exists and wants credentials. Do not "fix" the WS host to match the
+REST base URL — that was the original error here.
 
 Kalshi's base URL has changed multiple times. Other hosts appear in blogs and
 are stale. Verify against `docs.kalshi.com/welcome` and pin the OpenAPI spec
 in `docs/kalshi-api-snapshot/`.
+
+The signed path for the WS handshake is `/trade-api/ws/v2` — note `ws`, not
+the REST `/trade-api/v2`. Signing the REST prefix yields a 401 with no other
+symptom.
 
 There are **three** API surfaces: event contracts (this project), perpetual
 futures (`perps_openapi.yaml`), and Klear settlement. **Use event contracts
@@ -192,6 +210,51 @@ and for the recorder.
 
 The WebSocket **does** require auth on handshake, even for public channels.
 Sign the WS path.
+
+#### `/markets` query quirks (verified, both fail confusingly)
+
+- The `status` **filter** value is `open`. Market objects report
+  `"status": "active"`, so the filter vocabulary and the response vocabulary
+  disagree. `status=active` returns **HTTP 400**, not an empty list.
+- `status` requires a scoping filter. `/markets?status=open` alone is
+  **HTTP 400**; combine it with `series_ticker` or `event_ticker`.
+
+Both return 400 with a body, so a client that ignores the status code and
+reads `markets: []` concludes "no open markets" and moves on. Always throw on
+non-2xx.
+
+#### `/series/{ticker}` publishes the fee schedule
+
+`fee_type` (`"quadratic"`) and `fee_multiplier` (`1` for `KXHIGHNY`) come
+straight from the API, per series. The fee model should read these rather
+than hardcode the multiplier — same reasoning as fetching endpoint costs
+instead of assuming them.
+
+#### `mutually_exclusive` is the authority on bracket structure
+
+It is an **event-level** flag. `KXHIGHNY-26SEP01` carries
+`mutually_exclusive: true` and its six markets tile the range with no gap or
+overlap (≤82, 83-84, 85-86, 87-88, 89-90, ≥91). Never infer exclusivity from
+ticker shape; a wrong assumption manufactures constraint violations that
+don't exist.
+
+`floor_strike` / `cap_strike` are **off by one** from the human sub-title:
+`T83` has `cap_strike: 83` and `strike_type: "less"` but means "82° or
+below". Reconcile against `yes_sub_title` before deriving boundaries.
+
+#### The bracket constraint is asymmetric across sides
+
+- **Sell side** (short brackets, collect `Σbid`): exactly one bracket wins,
+  so liability is capped at $1.00 whether or not every leg is quoted —
+  dropping a leg only lowers the payout. So `Σbid > $1.00` is a real
+  violation over **any subset**.
+- **Buy side** (long brackets, pay `Σask`): the $1.00 only arrives if the
+  winner is in the set, so the guarantee needs **every** bracket. One
+  unquoted leg means there is no constraint to test.
+
+This matters in practice: illiquid tail brackets genuinely have no bids
+(live `KXHIGHNY-26SEP01-T90` had zero YES bids), so the two directions have
+different coverage requirements.
 
 ### Fixed-point representation
 
@@ -271,8 +334,21 @@ while BUFFERING:
 Discarding deltas at or below `snapshot.seq` is essential — they're already
 baked into the snapshot.
 
-Kalshi sends Ping roughly every 10s and expects Pong. Verify whether the JDK
-`HttpClient` WebSocket auto-responds; if not, handle it explicitly.
+Kalshi sends Ping roughly every 10s and expects Pong.
+
+**Resolved: the JDK auto-responds. Do not send a Pong yourself.** The
+`java.net.http.WebSocket.Listener.onPing` javadoc states that "the WebSocket
+implementation will automatically send a reciprocal pong when a ping is
+received", and `WebSocketImpl` carries a `lastAutomaticPong` field plus
+buffer accounting for "2 automatic Pong replies". The default `onPing` body
+is just `webSocket.request(1); return null;` — it does *not* send the Pong;
+the transport does, below the listener. An explicit `sendPong` would put a
+second, unsolicited Pong on the wire.
+
+Use ping arrival as a **liveness signal** instead: a connection can die
+without a close frame or an error, and ~10s pings make a long silence the
+only available symptom. The connection manager treats 35s (three missed
+intervals) as dead and reconnects.
 
 ### Fees
 
