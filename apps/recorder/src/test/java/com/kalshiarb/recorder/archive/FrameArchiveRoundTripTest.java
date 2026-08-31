@@ -294,6 +294,59 @@ class FrameArchiveRoundTripTest {
     }
 
     @Test
+    @DisplayName("REGRESSION: a frame with Kalshi's trailing newline stays on ONE line")
+    void trailingNewlineDoesNotBreakLineFraming(@TempDir Path dir) throws IOException {
+        // Kalshi terminates every WS text frame with a newline. Copied through by
+        // writeRawValue it pushed the envelope's closing brace onto the next line, so every
+        // record spanned two lines and the whole archive was unparseable -- while decoding
+        // continued to work fine, because Jackson ignores trailing whitespace. Found only by
+        // reading an archive back with an independent tool.
+        Path file;
+        try (GzipJsonLinesFrameWriter writer =
+                new GzipJsonLinesFrameWriter(dir, "frames", Clock.fixed(T0))) {
+            writer.write(new ArchivedFrame(NY, DELTA_JSON + "\n", T0, 1));
+            writer.write(new ArchivedFrame(NY, "  " + DELTA_JSON + "\r\n", T0 + 1, 2));
+            file = writer.currentPath();
+        }
+
+        List<String> lines = new ArrayList<>();
+        try (var gz = new java.util.zip.GZIPInputStream(Files.newInputStream(file));
+                var r = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(gz, StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (!line.isBlank()) {
+                    lines.add(line);
+                }
+            }
+        }
+
+        // Two frames, two lines -- not four.
+        assertThat(lines).hasSize(2);
+        assertThat(lines).allSatisfy(l -> assertThat(l.trim()).endsWith("}"));
+        assertThat(readAll(file)).hasSize(2);
+        assertThat(readAll(file)).allSatisfy(f ->
+                assertThat(f.json()).isEqualTo(DELTA_JSON));
+    }
+
+    @Test
+    @DisplayName("an interior newline is reflowed and counted rather than corrupting the format")
+    void interiorNewlineIsReflowed(@TempDir Path dir) throws IOException {
+        // Newlines between JSON tokens are insignificant whitespace, so replacing them with a
+        // space is semantically identity -- and it keeps the one-record-per-line invariant.
+        try (GzipJsonLinesFrameWriter writer =
+                new GzipJsonLinesFrameWriter(dir, "frames", Clock.fixed(T0))) {
+            writer.write(new ArchivedFrame(NY, "{\"a\":1,\n\"b\":2}", T0, 1));
+
+            assertThat(writer.reflowedFrames()).isEqualTo(1);
+            writer.flush();
+            assertThat(readAll(writer.currentPath()))
+                    .singleElement()
+                    .satisfies(f -> assertThat(f.json()).isEqualTo("{\"a\":1, \"b\":2}"));
+        }
+    }
+
+    @Test
     @DisplayName("a frame the codec cannot decode is still archived verbatim")
     void archivesUndecodableFrames(@TempDir Path dir) throws IOException {
         // The yes_dollars_fp lesson: the archive must not depend on our understanding of the

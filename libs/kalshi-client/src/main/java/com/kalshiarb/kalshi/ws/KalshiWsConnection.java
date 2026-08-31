@@ -258,7 +258,12 @@ public final class KalshiWsConnection implements AutoCloseable {
         public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
             partial.append(data);
             if (last) {
-                String json = partial.toString();
+                // strip(): Kalshi terminates each text frame with a newline. That is transport
+                // framing, not content -- Jackson ignores it when parsing, so it went unnoticed
+                // until an archive was read back and every record turned out to span two lines,
+                // because the trailing newline was copied through ahead of the envelope's
+                // closing brace. Normalising here fixes it once for every consumer.
+                String json = partial.toString().strip();
                 partial.setLength(0);
 
                 // Timestamp before anything else touches the frame, so the recorded receive

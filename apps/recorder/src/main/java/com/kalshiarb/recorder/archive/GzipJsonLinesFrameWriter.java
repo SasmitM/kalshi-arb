@@ -89,6 +89,7 @@ public final class GzipJsonLinesFrameWriter implements FrameWriter {
     private long bytesWritten;
     private int framesSinceFlush;
     private long lastFlushMillis;
+    private long reflowedFrames;
 
     public GzipJsonLinesFrameWriter(Path directory, String prefix, Clock clock) {
         this.directory = directory;
@@ -110,6 +111,8 @@ public final class GzipJsonLinesFrameWriter implements FrameWriter {
             openMember(day);
         }
 
+        String json = oneLine(frame.json());
+
         generator.writeStartObject();
         generator.writeNumberField("v", ArchivedFrame.SCHEMA_VERSION);
         generator.writeNumberField("recvMs", frame.receivedAtMillis());
@@ -117,12 +120,12 @@ public final class GzipJsonLinesFrameWriter implements FrameWriter {
         generator.writeStringField("family", frame.family().value());
         generator.writeFieldName("frame");
         // Raw: never re-serialise the exchange's own bytes.
-        generator.writeRawValue(frame.json());
+        generator.writeRawValue(json);
         generator.writeEndObject();
         generator.writeRaw('\n');
 
         framesWritten++;
-        bytesWritten += frame.json().length();
+        bytesWritten += json.length();
         framesSinceFlush++;
 
         long now = clock.currentTimeMillis();
@@ -130,6 +133,34 @@ public final class GzipJsonLinesFrameWriter implements FrameWriter {
                 || now - lastFlushMillis >= FLUSH_INTERVAL_MILLIS) {
             flushLocked(now);
         }
+    }
+
+    /**
+     * Guarantees the frame occupies exactly one line.
+     *
+     * <p>The format's one hard invariant is one record per line, and a caller can break it
+     * without noticing: Kalshi terminates every WebSocket text frame with a newline, which is
+     * insignificant to a JSON parser but fatal here — copied through raw, it pushed the
+     * envelope's closing brace onto the following line and made every record unparseable. The
+     * connection layer now strips it, and this method makes the invariant the writer's own
+     * responsibility rather than a convention callers must remember.
+     *
+     * <p>Any interior newline is replaced with a space. Outside a string literal a newline is
+     * insignificant JSON whitespace, so this is semantically identity; inside one the JSON was
+     * already invalid, and keeping the frame beats dropping it.
+     */
+    private String oneLine(String json) {
+        String trimmed = json.strip();
+        if (trimmed.indexOf('\n') < 0 && trimmed.indexOf('\r') < 0) {
+            return trimmed;
+        }
+        reflowedFrames++;
+        return trimmed.replace('\n', ' ').replace('\r', ' ');
+    }
+
+    /** Frames that arrived with interior newlines and had to be reflowed. Expected to stay 0. */
+    public synchronized long reflowedFrames() {
+        return reflowedFrames;
     }
 
     /** Opens a fresh gzip member, appending to the file for {@code day}. */
