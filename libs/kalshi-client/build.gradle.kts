@@ -28,3 +28,12 @@ tasks.register<JavaExec>("smokeCheck") {
     providers.environmentVariable("KALSHI_PRIVATE_KEY").orNull
             ?.let { environment("KALSHI_PRIVATE_KEY", it) }
 }
+
+tasks.register<JavaExec>("orderbookDemo") {
+    group = "verification"
+    description = "Prints live books for one event with derived asks, spreads and the " +
+        "crossed-book invariant. Unauthenticated. Args: [EVENT_TICKER]"
+    mainClass.set("com.kalshiarb.kalshi.diag.OrderbookDemo")
+    classpath = sourceSets["main"].runtimeClasspath
+    // ./gradlew orderbookDemo --args="KXHIGHLAX-26SEP01"
+}

@@ -36,6 +36,14 @@ subprojects {
         testLogging {
             events("passed", "skipped", "failed")
         }
+        // Pinned real API responses live at the repo root, not in module resources: they are
+        // shared documentation of the wire format (CLAUDE.md section 5) as much as test input,
+        // and duplicating them per module would let the copies drift.
+        systemProperty(
+            "kalshi.samples.dir",
+            rootProject.layout.projectDirectory.dir("docs/kalshi-api-snapshot/samples")
+                .asFile.absolutePath,
+        )
     }
 
     dependencies {

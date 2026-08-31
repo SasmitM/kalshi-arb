@@ -1,0 +1,52 @@
+{
+    "cursor": "CgYIsMHc1AYSEEtYSElHSE5ZLTI2QVVHMzE",
+    "events": [
+        {
+            "available_on_brokers": false,
+            "category": "Climate and Weather",
+            "collateral_return_type": "MECNET",
+            "event_ticker": "KXHIGHNY-26SEP01",
+            "exchange_index": 0,
+            "last_updated_ts": "2026-08-31T10:32:58.383168Z",
+            "mutually_exclusive": true,
+            "product_metadata": {
+                "competition": "High Temperature"
+            },
+            "series_ticker": "KXHIGHNY",
+            "settlement_sources": [
+                {
+                    "name": "The Weather Company",
+                    "url": "https://weather.com/kalshi"
+                }
+            ],
+            "strike_date": "2026-09-02T05:00:00Z",
+            "strike_period": "",
+            "sub_title": "On Sep 1, 2026",
+            "title": "Highest temperature in New York City on Sep 1, 2026?"
+        },
+        {
+            "available_on_brokers": false,
+            "category": "Climate and Weather",
+            "collateral_return_type": "MECNET",
+            "event_ticker": "KXHIGHNY-26AUG31",
+            "exchange_index": 0,
+            "last_updated_ts": "2026-08-30T09:32:57.004Z",
+            "mutually_exclusive": true,
+            "product_metadata": {
+                "competition": "High Temperature"
+            },
+            "series_ticker": "KXHIGHNY",
+            "settlement_sources": [
+                {
+                    "name": "The Weather Company",
+                    "url": "https://weather.com/kalshi"
+                }
+            ],
+            "strike_date": "2026-09-01T05:00:00Z",
+            "strike_period": "",
+            "sub_title": "On Aug 31, 2026",
+            "title": "Highest temperature in New York City on Aug 31, 2026?"
+        }
+    ],
+    "milestones": []
+}

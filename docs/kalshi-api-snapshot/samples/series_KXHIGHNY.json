@@ -1,0 +1,35 @@
+{
+    "series": {
+        "additional_prohibitions": [
+            "Persons who are employed by any of the Source Agencies are not permitted to trade on the Contract.",
+            "Persons who hold any material, non-public information on the Underlying are not permitted to trade on the Contract."
+        ],
+        "category": "Climate and Weather",
+        "contract_terms_url": "https://assets.kalshi.com/contract_terms/GLOBALTEMPERATURE.pdf",
+        "contract_url": "https://assets.kalshi.com/regulatory/product-certifications/GLOBALTEMPERATURE.pdf",
+        "exchange_index": 0,
+        "fee_multiplier": 1,
+        "fee_type": "quadratic",
+        "frequency": "daily",
+        "last_updated_ts": "2026-08-27T17:15:28.150014Z",
+        "product_metadata": {
+            "important_info": {
+                "id": "WEATHER-2025-3-3",
+                "markdown": "**Important information:** \n\nEffective Friday, August 14th, daily temperature markets will transition their settlement source from the National Weather Service (NWS) to The Weather Company. The Weather Company utilizes NWS as its primary underlying source, and official settlement data will be accessible at https://weather.com/kalshi.",
+                "message": "",
+                "title": ""
+            }
+        },
+        "settlement_sources": [
+            {
+                "name": "The Weather Company",
+                "url": "https://weather.com/kalshi"
+            }
+        ],
+        "tags": [
+            "Daily temperature"
+        ],
+        "ticker": "KXHIGHNY",
+        "title": "Highest temperature in NYC"
+    }
+}
