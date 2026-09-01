@@ -9,6 +9,7 @@ dependencies {
     implementation(project(":libs:common"))
     implementation(project(":libs:kalshi-client"))
     implementation(project(":libs:book"))
+    implementation(project(":libs:detector"))
     implementation(libs.jackson.core)
     implementation(libs.jackson.databind)
 }
@@ -26,6 +27,15 @@ tasks.register<JavaExec>("bookReplay") {
     description = "Replays the frame archive through the book layer and verifies it. " +
         "Args: [archiveDirOrFile]"
     mainClass.set("com.kalshiarb.recorder.BookReplay")
+    classpath = sourceSets["main"].runtimeClasspath
+    workingDir = rootProject.projectDir
+}
+
+tasks.register<JavaExec>("detectorReplay") {
+    group = "verification"
+    description = "Runs the detector over recorded frames and reports fee-adjusted, " +
+        "depth-limited violations. Args: [archiveDirOrFile] [maxContracts]"
+    mainClass.set("com.kalshiarb.recorder.DetectorReplay")
     classpath = sourceSets["main"].runtimeClasspath
     workingDir = rootProject.projectDir
 }
