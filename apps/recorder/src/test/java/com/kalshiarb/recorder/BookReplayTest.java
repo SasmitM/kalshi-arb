@@ -4,8 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.kalshiarb.common.Clock;
 import com.kalshiarb.model.EventTicker;
-import com.kalshiarb.recorder.archive.ArchivedFrame;
-import com.kalshiarb.recorder.archive.GzipJsonLinesFrameWriter;
+import com.kalshiarb.persistence.ArchivedFrame;
+import com.kalshiarb.persistence.GzipJsonLinesFrameWriter;
 import java.io.IOException;
 import java.nio.file.Path;
 import org.junit.jupiter.api.DisplayName;

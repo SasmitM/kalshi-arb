@@ -10,6 +10,7 @@ include(
     "libs:core-model",
     "libs:common",
     "libs:kalshi-client",
+    "libs:persistence",
     "libs:book",
     "libs:detector",
     "apps:recorder",

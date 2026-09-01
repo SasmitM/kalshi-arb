@@ -1,4 +1,4 @@
-package com.kalshiarb.recorder.archive;
+package com.kalshiarb.persistence;
 
 import java.io.Closeable;
 import java.io.IOException;

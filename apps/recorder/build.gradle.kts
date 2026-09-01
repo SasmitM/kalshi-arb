@@ -10,6 +10,7 @@ dependencies {
     implementation(project(":libs:kalshi-client"))
     implementation(project(":libs:book"))
     implementation(project(":libs:detector"))
+    implementation(project(":libs:persistence"))
     implementation(libs.jackson.core)
     implementation(libs.jackson.databind)
 }
@@ -27,6 +28,24 @@ tasks.register<JavaExec>("bookReplay") {
     description = "Replays the frame archive through the book layer and verifies it. " +
         "Args: [archiveDirOrFile]"
     mainClass.set("com.kalshiarb.recorder.BookReplay")
+    classpath = sourceSets["main"].runtimeClasspath
+    workingDir = rootProject.projectDir
+}
+
+tasks.register<JavaExec>("latencyStudy") {
+    group = "verification"
+    description = "Measures violation lifetimes and survival at 10/50/200/1000ms of latency. " +
+        "Args: [archiveDirOrFile] [contracts]"
+    mainClass.set("com.kalshiarb.recorder.LatencyStudy")
+    classpath = sourceSets["main"].runtimeClasspath
+    workingDir = rootProject.projectDir
+}
+
+tasks.register<JavaExec>("monotoneScan") {
+    group = "verification"
+    description = "Scans a live nested-threshold series for monotonicity violations. " +
+        "Args: [seriesTicker] [maxMarkets] [contracts]"
+    mainClass.set("com.kalshiarb.recorder.MonotoneScan")
     classpath = sourceSets["main"].runtimeClasspath
     workingDir = rootProject.projectDir
 }

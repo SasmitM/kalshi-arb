@@ -1,4 +1,4 @@
-package com.kalshiarb.recorder.archive;
+package com.kalshiarb.persistence;
 
 import static org.assertj.core.api.Assertions.assertThat;
 

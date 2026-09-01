@@ -55,7 +55,13 @@ public record Opportunity(
          * winning bracket is in the set, so this needs <b>every</b> bracket quoted. One unquoted
          * leg means there is no constraint to test at all.
          */
-        BUY_BRACKETS
+        BUY_BRACKETS,
+        /**
+         * Buy the dominating (lower) threshold and sell the dominated (higher) one, because
+         * {@code ask(lower) < bid(higher)} — the contract that pays out in a strict superset of
+         * worlds is cheaper than the one it dominates. Two legs, so two fees rather than five.
+         */
+        MONOTONE_PAIR
     }
 
     /**

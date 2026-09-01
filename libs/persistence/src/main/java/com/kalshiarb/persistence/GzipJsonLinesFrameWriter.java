@@ -1,4 +1,4 @@
-package com.kalshiarb.recorder.archive;
+package com.kalshiarb.persistence;
 
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonGenerator;

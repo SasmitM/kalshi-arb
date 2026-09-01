@@ -24,6 +24,10 @@ cannot both be correct:
   exactly one bracket, so the bracket prices must sum to $1.00.
 - **Nested thresholds must be monotone.** `price(temp >= 60) >= price(temp >= 65)`
   always, because every world where it's 65+ is also a world where it's 60+.
+  Note the `KXHIGH*` weather events have **no** nested thresholds — each carries
+  exactly one `less` and one `greater` market plus four `between` brackets, so
+  there is no `>=X` pair to compare. `KXBTCD` publishes ~50 nested `greater`
+  thresholds per event and is the series to test this constraint against.
 
 ### Why this framing matters
 
@@ -431,8 +435,10 @@ five brackets whose asks sum to $0.96 look like a 4c risk-free profit, but
 fees at 0.30/0.25/0.20/0.13/0.08 total 5.21c, so the trade **loses 1.2c**.
 
 Verify the current fee schedule against Kalshi's published PDF. Third-party
-blogs get this wrong constantly. The multiplier is category-specific and
-higher for crypto.
+blogs get this wrong constantly. The multiplier is per-series and must be read
+from `/series/{ticker}` rather than assumed by category — measured, `KXBTCD`
+(bitcoin daily) reports `fee_multiplier: 1`, the same as weather, so "higher
+for crypto" does not hold as a general rule.
 
 ### Rate limits
 
